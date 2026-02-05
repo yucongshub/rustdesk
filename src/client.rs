@@ -428,11 +428,11 @@ impl Client {
                 if port > 0 {
                     break;
                 }
-                // await for 0.5 RTT
-                if tm.elapsed() > rtt / 2 {
+                // Wait up to 2000ms for UDP hole punching
+                if tm.elapsed() > Duration::from_millis(2000) {
                     break;
                 }
-                hbb_common::sleep(0.001).await;
+                hbb_common::sleep(0.01).await;
             }
         }
         // Stop UDP NAT test task if still running
