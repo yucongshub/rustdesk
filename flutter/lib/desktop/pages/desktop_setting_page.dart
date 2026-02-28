@@ -499,6 +499,8 @@ class _GeneralState extends State<_General> {
               kOptionAllowAlwaysSoftwareRender,
             ),
           ),
+/*
+        // 隐藏“Use texture rendering”材质渲染选项
         if (!isWeb)
           Tooltip(
             message: translate('texture_render_tip'),
@@ -511,6 +513,7 @@ class _GeneralState extends State<_General> {
                   await bind.mainSetLocalOption(key: k, value: v ? 'Y' : 'N'),
             ),
           ),
+*/
         if (isWindows)
           Tooltip(
             message: translate('d3d_render_tip'),
@@ -521,6 +524,8 @@ class _GeneralState extends State<_General> {
               isServer: false,
             ),
           ),
+/*
+        // 隐藏“Check for software update on startup”开机检查更新选项
         if (!isWeb && !bind.isCustomClient())
           _OptionCheckBox(
             context,
@@ -528,6 +533,7 @@ class _GeneralState extends State<_General> {
             kOptionEnableCheckUpdate,
             isServer: false,
           ),
+*/
         if (showAutoUpdate)
           _OptionCheckBox(
             context,
@@ -541,6 +547,8 @@ class _GeneralState extends State<_General> {
             'Capture screen using DirectX',
             kOptionDirectxCapture,
           ),
+/*
+        // 隐藏“Enable UDP hole punching”与“Enable IPv6 P2P connection”打洞相关选项
         if (!bind.isIncomingOnly()) ...[
           _OptionCheckBox(
             context,
@@ -555,6 +563,7 @@ class _GeneralState extends State<_General> {
             isServer: false,
           ),
         ],
+*/
       ],
     ];
 
@@ -1035,10 +1044,14 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
             _OptionCheckBox(
                 context, 'Enable file transfer', kOptionEnableFileTransfer,
                 enabled: enabled, fakeValue: fakeValue),
+/*
+            // 隐藏“Enable audio”启用音频选项
             _OptionCheckBox(context, 'Enable audio', kOptionEnableAudio,
                 enabled: enabled, fakeValue: fakeValue),
+            // 隐藏“Enable camera”启用摄像头选项
             _OptionCheckBox(context, 'Enable camera', kOptionEnableCamera,
                 enabled: enabled, fakeValue: fakeValue),
+*/
             _OptionCheckBox(context, 'Enable terminal', kOptionEnableTerminal,
                 enabled: enabled, fakeValue: fakeValue),
             _OptionCheckBox(
@@ -1054,9 +1067,12 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
               _OptionCheckBox(context, 'Enable blocking user input',
                   kOptionEnableBlockInput,
                   enabled: enabled, fakeValue: fakeValue),
+/*
+            // 隐藏“Enable remote configuration modification”允许远程修改配置选项
             _OptionCheckBox(context, 'Enable remote configuration modification',
                 kOptionAllowRemoteConfigModification,
                 enabled: enabled, fakeValue: fakeValue),
+*/
           ],
         ),
       ]);
@@ -1225,9 +1241,13 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
     bool enabled = !locked;
     return _Card(title: 'Security', children: [
       shareRdp(context, enabled),
+/*
+      // 隐藏“Deny LAN discovery”禁止局域网发现选项
       _OptionCheckBox(context, 'Deny LAN discovery', 'enable-lan-discovery',
           reverse: true, enabled: enabled),
+      // 隐藏“Direct IP Access”直连服务器选项
       ...directIp(context),
+*/
       whitelist(),
       ...autoDisconnect(context),
       _OptionCheckBox(context, 'keep-awake-during-incoming-sessions-label',
