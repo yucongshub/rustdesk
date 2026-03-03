@@ -22,6 +22,9 @@ const TIME_CONN: Duration = Duration::from_secs(3);
 lazy_static::lazy_static! {
     static ref SENDER : Mutex<broadcast::Sender<Vec<i32>>> = Mutex::new(start_hbbs_sync());
     static ref PRO: Arc<Mutex<bool>> = Default::default();
+    pub static ref ACCESS_TOKEN: std::sync::RwLock<String> = std::sync::RwLock::new(
+        LocalConfig::get_option("access_token")
+    );
 }
 
 #[cfg(not(any(target_os = "ios")))]
@@ -94,7 +97,7 @@ async fn start_hbbs_sync_async() {
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                let access_token = LocalConfig::get_option("access_token");
+                let access_token = ACCESS_TOKEN.read().unwrap().clone();
                 if access_token.is_empty() {
                     continue;
                 }
@@ -251,12 +254,27 @@ async fn start_hbbs_sync_async() {
                         if let Some(err) = rsp.remove("error") {
                             if err == "inactive" {
                                 log::info!("session is inactive, logging out");
-                                let mut data = HashMap::new();
-                                data.insert("name", "logout");
-                                let _res = crate::flutter::push_global_event(
-                                    crate::flutter::APP_TYPE_MAIN,
-                                    serde_json::ser::to_string(&data).unwrap_or("".to_owned()),
-                                );
+                                *ACCESS_TOKEN.write().unwrap() = "".to_owned();
+                                // Direct push for same-process scenario (macOS)
+                                if !crate::common::is_cm() {
+                                    let mut data = HashMap::new();
+                                    data.insert("name", "logout");
+                                    #[cfg(feature = "flutter")]
+                                    let _res = crate::flutter::push_global_event(
+                                        crate::flutter::APP_TYPE_MAIN,
+                                        serde_json::ser::to_string(&data).unwrap_or("".to_owned()),
+                                    );
+                                }
+                                // Also send empty token to CM IPC for cross-process scenario (Windows)
+                                if let Ok(mut c) = crate::ipc::connect(1000, "_cm").await {
+                                    c.send(&crate::ipc::Data::Config((
+                                        "access_token".to_owned(),
+                                        Some("".to_owned()),
+                                    )))
+                                    .await
+                                    .ok();
+                                    log::info!("sent empty access_token to CM for UI logout");
+                                }
                                 continue;
                             }
                         }

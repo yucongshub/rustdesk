@@ -1176,6 +1176,15 @@ async fn check_connect_status_(reconnect: bool, rx: mpsc::UnboundedReceiver<ipc:
 
     loop {
         if let Ok(mut c) = ipc::connect(1000, "").await {
+            let local_token = LocalConfig::get_option("access_token");
+            if !local_token.is_empty() {
+                c.send(&ipc::Data::Config((
+                    "access_token".to_owned(),
+                    Some(local_token),
+                )))
+                .await
+                .ok();
+            }
             let mut timer = crate::rustdesk_interval(time::interval(time::Duration::from_secs(1)));
             loop {
                 tokio::select! {
@@ -1205,6 +1214,18 @@ async fn check_connect_status_(reconnect: bool, rx: mpsc::UnboundedReceiver<ipc:
                                     }
                                 } else if name == "temporary-password" {
                                     *TEMPORARY_PASSWD.lock().unwrap() = value;
+                                } else if name == "access_token" {
+                                    if value.is_empty() {
+                                        let local_token = LocalConfig::get_option("access_token");
+                                        if !local_token.is_empty() {
+                                            LocalConfig::set_option("access_token".to_owned(), "".to_owned());
+                                            #[cfg(feature = "flutter")]
+                                            crate::flutter::push_global_event(
+                                                crate::flutter::APP_TYPE_MAIN,
+                                                "{\"name\":\"logout\"}".to_owned(),
+                                            );
+                                        }
+                                    }
                                 }
                             }
                             #[cfg(feature = "flutter")]
@@ -1252,6 +1273,7 @@ async fn check_connect_status_(reconnect: bool, rx: mpsc::UnboundedReceiver<ipc:
                     }
                     _ = timer.tick() => {
                         c.send(&ipc::Data::OnlineStatus(None)).await.ok();
+                        c.send(&ipc::Data::Config(("access_token".to_owned(), None))).await.ok();
                         c.send(&ipc::Data::Options(None)).await.ok();
                         c.send(&ipc::Data::Config(("id".to_owned(), None))).await.ok();
                         c.send(&ipc::Data::Config(("temporary-password".to_owned(), None))).await.ok();
@@ -1303,6 +1325,15 @@ pub fn option_synced() -> bool {
 #[tokio::main(flavor = "current_thread")]
 pub(crate) async fn send_to_cm(data: &ipc::Data) {
     if let Ok(mut c) = ipc::connect(1000, "_cm").await {
+        c.send(data).await.ok();
+    }
+}
+
+#[cfg(any(target_os = "android", feature = "flutter"))]
+#[cfg(not(any(target_os = "ios")))]
+#[tokio::main(flavor = "current_thread")]
+pub(crate) async fn send_to_daemon(data: &ipc::Data) {
+    if let Ok(mut c) = ipc::connect(1000, "").await {
         c.send(data).await.ok();
     }
 }

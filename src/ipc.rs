@@ -662,6 +662,8 @@ async fn handle(data: Data, stream: &mut Connection) {
                     value = Some(Config::get_unlock_pin());
                 } else if name == "trusted-devices" {
                     value = Some(Config::get_trusted_devices_json());
+                } else if name == "access_token" {
+                    value = Some(crate::hbbs_http::sync::ACCESS_TOKEN.read().unwrap().clone());
                 } else {
                     value = None;
                 }
@@ -681,6 +683,8 @@ async fn handle(data: Data, stream: &mut Connection) {
                     crate::audio_service::set_voice_call_input_device(Some(value), true);
                 } else if name == "unlock-pin" {
                     Config::set_unlock_pin(&value);
+                } else if name == "access_token" {
+                    *crate::hbbs_http::sync::ACCESS_TOKEN.write().unwrap() = value;
                 } else {
                     return;
                 }

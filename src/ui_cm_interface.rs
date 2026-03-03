@@ -587,6 +587,20 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
                                     LocalConfig::set_option("lang".to_owned(), lang);
                                     self.cm.change_language();
                                 }
+                                Data::Config((name, Some(value))) => {
+                                    if name == "access_token" && value.is_empty() {
+                                        let local_token = LocalConfig::get_option("access_token");
+                                        if !local_token.is_empty() {
+                                            LocalConfig::set_option("access_token".to_owned(), "".to_owned());
+                                            #[cfg(feature = "flutter")]
+                                            crate::flutter::push_global_event(
+                                                crate::flutter::APP_TYPE_MAIN,
+                                                "{\"name\":\"logout\"}".to_owned(),
+                                            );
+                                            log::info!("access_token cleared by daemon via CM IPC, UI logout triggered");
+                                        }
+                                    }
+                                }
                                 Data::DataPortableService(ipc::DataPortableService::CmShowElevation(show)) => {
                                     self.cm.show_elevation(show);
                                 }
