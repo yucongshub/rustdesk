@@ -16,6 +16,7 @@ import 'package:flutter_hbb/models/peer_model.dart';
 
 import '../../common.dart';
 import '../../common/formatter/id_formatter.dart';
+import '../../common/widgets/login.dart';
 import '../../common/widgets/peer_tab_page.dart';
 import '../../common/widgets/autocomplete.dart';
 import '../../models/platform_model.dart';
@@ -288,7 +289,7 @@ class _ConnectionPageState extends State<ConnectionPage>
           children: [
             Row(
               children: [
-                Flexible(child: _buildRemoteIDTextField(context)),
+                Flexible(child: _buildConnectionHeader(context)),
               ],
             ).marginOnly(top: 22),
             SizedBox(height: 12),
@@ -299,6 +300,98 @@ class _ConnectionPageState extends State<ConnectionPage>
         if (!isOutgoingOnly) const Divider(height: 1),
         if (!isOutgoingOnly) OnlineStatusWidget()
       ],
+    );
+  }
+
+  Widget _buildConnectionHeader(BuildContext context) {
+    if (bind.isDisableAccount()) {
+      return _buildRemoteIDTextField(context);
+    }
+
+    return LayoutBuilder(builder: (context, constraints) {
+      final compact = constraints.maxWidth < 620;
+      if (compact) {
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            _buildRemoteIDTextField(context),
+            const SizedBox(height: 12),
+            _buildAccountPanel(context, width: 360),
+          ],
+        );
+      }
+
+      return Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Flexible(child: _buildRemoteIDTextField(context)),
+          const SizedBox(width: 12),
+          _buildAccountPanel(context),
+        ],
+      );
+    });
+  }
+
+  Widget _buildAccountPanel(BuildContext context, {double width = 240}) {
+    final textColor = Theme.of(context).textTheme.titleLarge?.color;
+    final secondaryTextColor = textColor?.withOpacity(0.55);
+
+    return Container(
+      width: width,
+      padding: const EdgeInsets.fromLTRB(18, 18, 18, 18),
+      decoration: BoxDecoration(
+        borderRadius: const BorderRadius.all(Radius.circular(13)),
+        border: Border.all(color: Theme.of(context).colorScheme.surface),
+      ),
+      child: Obx(() {
+        final userName = gFFI.userModel.userName.value;
+        final isLogin = userName.isNotEmpty;
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Row(
+              children: [
+                Icon(Icons.person_outline, size: 18, color: secondaryTextColor),
+                const SizedBox(width: 8),
+                Text(
+                  translate('Account'),
+                  style: TextStyle(fontSize: 16, color: textColor),
+                ),
+              ],
+            ),
+            const SizedBox(height: 14),
+            if (isLogin)
+              SelectionArea(
+                child: Text(
+                  '${translate('Username')}: $userName',
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(fontSize: 14, color: secondaryTextColor),
+                ),
+              )
+            else
+              Text(
+                '${translate('Username')}: -',
+                style: TextStyle(fontSize: 14, color: secondaryTextColor),
+              ),
+            const SizedBox(height: 16),
+            SizedBox(
+              height: 30,
+              child: ElevatedButton(
+                onPressed: () {
+                  if (isLogin) {
+                    logOutConfirmDialog();
+                  } else {
+                    loginDialog();
+                  }
+                },
+                child: Text(translate(isLogin ? 'Logout' : 'Login')),
+              ),
+            ),
+          ],
+        );
+      }),
     );
   }
 

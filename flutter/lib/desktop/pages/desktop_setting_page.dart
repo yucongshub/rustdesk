@@ -56,7 +56,6 @@ enum SettingsTabKey {
   network,
   display,
   plugin,
-  account,
   printer,
   about,
 }
@@ -76,7 +75,6 @@ class DesktopSettingPage extends StatefulWidget {
     if (!bind.isIncomingOnly()) SettingsTabKey.display,
     if (!isWeb && !bind.isIncomingOnly() && bind.pluginFeatureIsEnabled())
       SettingsTabKey.plugin,
-    if (!bind.isDisableAccount()) SettingsTabKey.account,
     if (isWindows &&
         bind.mainGetBuildinOption(key: kOptionHideRemotePrinterSetting) != 'Y')
       SettingsTabKey.printer,
@@ -200,10 +198,6 @@ class _DesktopSettingPageState extends State<DesktopSettingPage>
           settingTabs.add(_TabInfo(
               tab, 'Plugin', Icons.extension_outlined, Icons.extension));
           break;
-        case SettingsTabKey.account:
-          settingTabs.add(
-              _TabInfo(tab, 'Account', Icons.person_outline, Icons.person));
-          break;
         case SettingsTabKey.printer:
           settingTabs
               .add(_TabInfo(tab, 'Printer', Icons.print_outlined, Icons.print));
@@ -235,9 +229,6 @@ class _DesktopSettingPageState extends State<DesktopSettingPage>
           break;
         case SettingsTabKey.plugin:
           children.add(const _Plugin());
-          break;
-        case SettingsTabKey.account:
-          children.add(const _Account());
           break;
         case SettingsTabKey.printer:
           children.add(const _Printer());
@@ -2005,56 +1996,6 @@ class _DisplayState extends State<_Display> {
     final children =
         otherDefaultSettings().map((e) => otherRow(e.$1, e.$2)).toList();
     return _Card(title: 'Other Default Options', children: children);
-  }
-}
-
-class _Account extends StatefulWidget {
-  const _Account({Key? key}) : super(key: key);
-
-  @override
-  State<_Account> createState() => _AccountState();
-}
-
-class _AccountState extends State<_Account> {
-  @override
-  Widget build(BuildContext context) {
-    final scrollController = ScrollController();
-    return ListView(
-      controller: scrollController,
-      children: [
-        _Card(title: 'Account', children: [accountAction(), useInfo()]),
-      ],
-    ).marginOnly(bottom: _kListViewBottomMargin);
-  }
-
-  Widget accountAction() {
-    return Obx(() => _Button(
-        gFFI.userModel.userName.value.isEmpty ? 'Login' : 'Logout',
-        () => {
-              gFFI.userModel.userName.value.isEmpty
-                  ? loginDialog()
-                  : logOutConfirmDialog()
-            }));
-  }
-
-  Widget useInfo() {
-    text(String key, String value) {
-      return Align(
-        alignment: Alignment.centerLeft,
-        child: SelectionArea(child: Text('${translate(key)}: $value'))
-            .marginSymmetric(vertical: 4),
-      );
-    }
-
-    return Obx(() => Offstage(
-          offstage: gFFI.userModel.userName.value.isEmpty,
-          child: Column(
-            children: [
-              text('Username', gFFI.userModel.userName.value),
-              // text('Group', gFFI.groupModel.groupName.value),
-            ],
-          ),
-        )).marginOnly(left: 18, top: 16);
   }
 }
 
