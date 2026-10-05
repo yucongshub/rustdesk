@@ -923,7 +923,9 @@ Future<bool?> _openLoginDialog() async {
                     close(true);
 
                     if (resp != null) {
-                      handleLoginResponse(resp, false, null);
+                      // Rust 侧已保存 access_token，但需要再经 mainSetLocalOption 保存一次，
+                      // 才会同步给后台服务（心跳）和 CM，与密码登录保持一致
+                      handleLoginResponse(resp, true, null);
                     }
                   },
                 ),
