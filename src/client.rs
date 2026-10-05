@@ -3839,7 +3839,9 @@ pub fn check_if_retry(msgtype: &str, title: &str, text: &str, retry_for_relay: b
                 && !text.to_lowercase().contains("resolve")
                 && !text.to_lowercase().contains("mismatch")
                 && !text.to_lowercase().contains("manually")
-                && !text.to_lowercase().contains("not allowed")))
+                && !text.to_lowercase().contains("not allowed")
+                // 登录鉴权失败（请先登录 / 登录已失效 / 对方设备未登录），重连没有意义
+                && !text.contains("登录")))
 }
 
 pub async fn hc_connection(
