@@ -528,6 +528,8 @@ class _GeneralState extends State<_General> {
               kOptionAllowAlwaysSoftwareRender,
             ),
           ),
+/*
+        // 隐藏“Use texture rendering”材质渲染选项（强制开启，见 src/custom_settings.rs）
         if (!isWeb)
           Tooltip(
             message: translate('texture_render_tip'),
@@ -540,6 +542,7 @@ class _GeneralState extends State<_General> {
                   await bind.mainSetLocalOption(key: k, value: v ? 'Y' : 'N'),
             ),
           ),
+*/
         if (isWindows)
           Tooltip(
             message: translate('d3d_render_tip'),
@@ -551,6 +554,8 @@ class _GeneralState extends State<_General> {
             ),
           ),
       ],
+/*
+      // 隐藏“Check for software update on startup”启动时检查更新选项（强制关闭）
       if (!isWeb && !bind.isCustomClient())
         _OptionCheckBox(
           context,
@@ -558,6 +563,7 @@ class _GeneralState extends State<_General> {
           kOptionEnableCheckUpdate,
           isServer: false,
         ),
+*/
       if (showAutoUpdate)
         _OptionCheckBox(
           context,
@@ -578,6 +584,8 @@ class _GeneralState extends State<_General> {
           kOptionEnableTcpPunch,
           isServer: false,
         ),
+/*
+        // 隐藏“Enable UDP hole punching”与“Enable IPv6 P2P connection”打洞选项（强制开启）
         _OptionCheckBox(
           context,
           'Enable UDP hole punching',
@@ -590,6 +598,7 @@ class _GeneralState extends State<_General> {
           kOptionEnableIpv6Punch,
           isServer: false,
         ),
+*/
       ],
       if (!incomingOnly) ...webrtcOptions(context),
       if (!isWeb && !incomingOnly)
@@ -1197,10 +1206,13 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
             _OptionCheckBox(
                 context, 'Enable file transfer', kOptionEnableFileTransfer,
                 enabled: enabled, fakeValue: fakeValue),
+/*
+            // 隐藏“Enable audio”“Enable camera”选项（强制关闭）
             _OptionCheckBox(context, 'Enable audio', kOptionEnableAudio,
                 enabled: enabled, fakeValue: fakeValue),
             _OptionCheckBox(context, 'Enable camera', kOptionEnableCamera,
                 enabled: enabled, fakeValue: fakeValue),
+*/
             _OptionCheckBox(context, 'Enable terminal', kOptionEnableTerminal,
                 enabled: enabled, fakeValue: fakeValue),
             _OptionCheckBox(
@@ -1392,9 +1404,12 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
     bool enabled = !locked;
     return _Card(title: 'Security', children: [
       shareRdp(context, enabled),
+/*
+      // 隐藏“Deny LAN discovery”与“Direct IP Access”选项（强制拒绝局域网发现、关闭 IP 直连）
       _OptionCheckBox(context, 'Deny LAN discovery', 'enable-lan-discovery',
           reverse: true, enabled: enabled),
       ...directIp(context),
+*/
       whitelist(),
       idWhitelist(),
       ...autoDisconnect(context),
@@ -2532,7 +2547,7 @@ class _AboutState extends State<_About> {
       final scrollController = ScrollController();
       return SingleChildScrollView(
         controller: scrollController,
-        child: _Card(title: translate('About RustDesk'), children: [
+        child: _Card(title: '关于远程工具', children: [
           Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
@@ -2552,6 +2567,8 @@ class _AboutState extends State<_About> {
               SelectionArea(
                   child: Text('${translate('ID')}: $myId')
                       .marginSymmetric(vertical: 4.0)),
+/*
+              // 隐藏隐私声明、官网链接和版权信息
               InkWell(
                   onTap: () {
                     launchUrlString('https://rustdesk.com/privacy.html');
@@ -2595,6 +2612,7 @@ class _AboutState extends State<_About> {
                   ],
                 )),
               ).marginSymmetric(vertical: 4.0)
+*/
             ],
           ).marginOnly(left: _kContentHMargin)
         ]),

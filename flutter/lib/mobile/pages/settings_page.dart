@@ -463,6 +463,8 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                 });
               },
       ),
+/*
+      // 隐藏“Direct IP Access”IP 直连设置（强制关闭）
       SettingsTile.switchTile(
         title: Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -510,6 +512,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                 setState(() {});
               },
       ),
+*/
       SettingsTile.switchTile(
         title: Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -629,6 +632,8 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
           gFFI.invokeMethod(AndroidChannel.kSetStartOnBootOpt, toValue);
         }));
 
+/*
+    // 隐藏“Check for software update on startup”启动时检查更新设置（强制关闭）
     if (!bind.isCustomClient()) {
       enhancementsTiles.add(
         SettingsTile.switchTile(
@@ -644,6 +649,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
         ),
       );
     }
+*/
 
     enhancementsTiles.add(
       SettingsTile.switchTile(
@@ -834,6 +840,8 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                       });
                     },
             ),
+/*
+          // 隐藏“Enable UDP hole punching”与“Enable IPv6 P2P connection”打洞设置（强制开启）
           if (!incomingOnly)
             SettingsTile.switchTile(
               title: Text(translate('Enable UDP hole punching')),
@@ -864,6 +872,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                       });
                     },
             ),
+*/
           if (!incomingOnly)
             SettingsTile.switchTile(
               title: Text(translate('Enable WebRTC P2P connection')),
