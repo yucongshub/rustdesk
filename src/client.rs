@@ -847,10 +847,7 @@ impl Client {
         };
 
         let switch_code = interface.get_switch_code();
-        // hbbs 未实现 KeyExchange，跳过；hbbs 支持 Kx v1 后删除
-        let legacy_secure = !crate::custom_settings::SKIP_RENDEZVOUS_KEY_EXCHANGE
-            && !key.is_empty()
-            && (!token.is_empty() || !switch_code.is_empty());
+        let legacy_secure = !key.is_empty() && (!token.is_empty() || !switch_code.is_empty());
         let carries_offer = webrtc_offerer.as_ref().and_then(|g| g.stream()).is_some();
         // Counted from before the key exchange, so the exchange spends the UDP NAT test's own
         // wait rather than replacing it: the test runs beside both.
@@ -886,7 +883,9 @@ impl Client {
         // waiting for the UDP NAT test. The WebRTC exchange does not replace that wait, it only
         // spends part of the same budget, so what is left of it is waited out here and a result
         // that has already arrived is taken at once.
-        if let Some(udp) = udp.1.as_ref().filter(|_| !legacy_secure) {
+        // 定制：带 token 时也等待 UDP NAT 探测结果（至少 UDP_NAT_TEST_WAIT_MIN，拿到即继续），
+        // 保持此前跳过密钥交换时的打洞行为；等待从密钥交换之前开始计时，交换耗时计入其中。
+        if let Some(udp) = udp.1.as_ref() {
             let tm = udp_nat_wait_from;
             // rtt is the TCP connect time. When it is too short to be a real WAN round trip it
             // says nothing about the UDP path (a TUN VPN or the LAN gateway answered the
@@ -1799,11 +1798,7 @@ impl Client {
                 .await
                 .with_context(|| "Failed to connect to rendezvous server")?;
 
-            // hbbs 未实现 KeyExchange，跳过；hbbs 支持 Kx v1 后删除
-            if !crate::custom_settings::SKIP_RENDEZVOUS_KEY_EXCHANGE
-                && !key.is_empty()
-                && (!token.is_empty() || !switch_code.is_empty())
-            {
+            if !key.is_empty() && (!token.is_empty() || !switch_code.is_empty()) {
                 secure_tcp(&mut socket, key).await?;
             }
 
