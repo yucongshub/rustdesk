@@ -5,7 +5,7 @@ import 'package:flutter_hbb/common/widgets/login.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
 
 const kLoginRequiredTip = '请先登录后再发起远程连接';
-const kNotLoggedInCardTip = '当前未登录：无法发起远程连接，其他人也无法连接本机。';
+const kNotLoggedInCardTip = '当前未登录：无法使用远程连接';
 
 /// 是否启用登录检查（Web 端和禁用账号的定制客户端不检查）
 bool isLoginCheckEnabled() => !isWeb && !bind.isDisableAccount();
