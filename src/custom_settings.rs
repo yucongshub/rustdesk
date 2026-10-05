@@ -21,13 +21,8 @@ pub const API_SERVER: &str = "https://scdesk.succez.com:22111";
 /// hbbs 公钥。
 pub const RS_PUB_KEY: &str = "MUGpFstr3XGdryYqJsa2M1MWwRLNvjsOgSgmFmw4aKQ=";
 
-/// hbbs 未实现 KeyExchange，跳过；hbbs 支持 Kx v1 后删除。
-/// 为 true 时，打洞（PunchHoleRequest，仍携带 token）和中继（RequestRelay）请求不再
-/// 调用 secure_tcp 等待 rendezvous 服务器的 KeyExchange（否则等待 18s 后连接失败）。
-/// WebRTC 的 secure_tcp_required 不受影响（非官方服务器默认关闭 WebRTC，开启时会自行降级）。
-pub const SKIP_RENDEZVOUS_KEY_EXCHANGE: bool = true;
-
 /// 发起打洞请求前，等待 UDP NAT 探测结果的最短时间（拿到结果会立即继续）。
+/// 带 token 的请求也会等待，官方 1.5.0 在完成密钥交换后不再等待。
 pub const UDP_NAT_TEST_WAIT_MIN: Duration = Duration::from_millis(2000);
 
 /// 注入定制配置。可以重复调用；只补充尚未设置的项，不覆盖 custom.txt 等写入的值。
