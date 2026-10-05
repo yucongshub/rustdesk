@@ -17,13 +17,13 @@ use hbb_common::{
     bail,
     config::{Config, CONNECT_TIMEOUT, RELAY_PORT},
     log,
-    message_proto::*,
     protobuf::{Enum, Message as _},
     rendezvous_proto::*,
     socket_client,
     sodiumoxide::crypto::{box_, sign},
     timeout, tokio, ResultType, Stream,
 };
+use base::message_proto::*;
 use scrap::camera;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use service::ServiceTmpl;
@@ -44,6 +44,8 @@ mod clipboard_service;
 pub use clipboard_service::is_clipboard_service_ok;
 #[cfg(target_os = "linux")]
 pub(crate) mod wayland;
+#[cfg(all(target_os = "linux", feature = "drm"))]
+pub(crate) mod drm_capturer;
 #[cfg(target_os = "linux")]
 pub mod uinput;
 #[cfg(target_os = "linux")]
@@ -67,6 +69,8 @@ pub mod input_service {
 }
 
 mod connection;
+mod login_failure_check;
+pub(crate) mod port_forward_mux;
 pub mod display_service;
 #[cfg(windows)]
 pub mod portable_service;
@@ -80,8 +84,18 @@ pub mod printer_service;
 pub type Childs = Arc<Mutex<Vec<std::process::Child>>>;
 type ConnMap = HashMap<i32, ConnInner>;
 
+#[derive(Clone, Default)]
+pub struct ConnectionMeta {
+    pub control_permissions: Option<ControlPermissions>,
+    pub controlled_context: Option<ControlledContext>,
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const CONFIG_SYNC_INTERVAL_SECS: f32 = 0.3;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+// 3s is enough for at least one initial sync attempt:
+// 0.3s backoff + up to 1s connect timeout + up to 1s response timeout.
+const CONFIG_SYNC_INITIAL_WAIT_SECS: u64 = 3;
 
 lazy_static::lazy_static! {
     pub static ref CHILD_PROCESS: Childs = Default::default();
@@ -103,6 +117,15 @@ pub struct Server {
 
 pub type ServerPtr = Arc<RwLock<Server>>;
 pub type ServerPtrWeak = Weak<RwLock<Server>>;
+
+#[cfg(test)]
+pub fn new_for_test() -> ServerPtr {
+    Arc::new(RwLock::new(Server {
+        connections: HashMap::new(),
+        services: HashMap::new(),
+        id_count: 1000,
+    }))
+}
 
 pub fn new() -> ServerPtr {
     let mut server = Server {
@@ -158,7 +181,8 @@ async fn accept_connection_(
     server: ServerPtr,
     socket: Stream,
     secure: bool,
-    control_permissions: Option<ControlPermissions>,
+    meta: ConnectionMeta,
+    slot: crate::rendezvous_mediator::PunchSlot,
 ) -> ResultType<()> {
     let local_addr = socket.local_addr();
     drop(socket);
@@ -168,6 +192,8 @@ async fn accept_connection_(
     let listener = new_listener(local_addr, true).await?;
     log::info!("Server listening on: {}", &listener.local_addr()?);
     if let Ok((stream, addr)) = timeout(CONNECT_TIMEOUT, listener.accept()).await? {
+        // The peer is in: the place goes back before the session runs, as every punch's does.
+        drop(slot);
         stream.set_nodelay(true).ok();
         let stream_addr = stream.local_addr()?;
         create_tcp_connection(
@@ -175,7 +201,7 @@ async fn accept_connection_(
             Stream::from(stream, stream_addr),
             addr,
             secure,
-            control_permissions,
+            meta,
         )
         .await?;
     }
@@ -187,59 +213,23 @@ pub async fn create_tcp_connection(
     stream: Stream,
     addr: SocketAddr,
     secure: bool,
-    control_permissions: Option<ControlPermissions>,
+    meta: ConnectionMeta,
 ) -> ResultType<()> {
     let mut stream = stream;
+    // The address the connection layer keys on, whitelist and admission alike.
+    let addr = hbb_common::try_into_v4(addr);
     let id = server.write().unwrap().get_new_id();
-    let (sk, pk) = Config::get_key_pair();
-    if secure && pk.len() == sign::PUBLICKEYBYTES && sk.len() == sign::SECRETKEYBYTES {
-        let mut sk_ = [0u8; sign::SECRETKEYBYTES];
-        sk_[..].copy_from_slice(&sk);
-        let sk = sign::SecretKey(sk_);
-        let mut msg_out = Message::new();
-        let (our_pk_b, our_sk_b) = box_::gen_keypair();
-        msg_out.set_signed_id(SignedId {
-            id: sign::sign(
-                &IdPk {
-                    id: Config::get_id(),
-                    pk: Bytes::from(our_pk_b.0.to_vec()),
-                    ..Default::default()
-                }
-                .write_to_bytes()
-                .unwrap_or_default(),
-                &sk,
-            )
-            .into(),
-            ..Default::default()
-        });
-        timeout(CONNECT_TIMEOUT, stream.send(&msg_out)).await??;
-        match timeout(CONNECT_TIMEOUT, stream.next()).await? {
-            Some(res) => {
-                let bytes = res?;
-                if let Ok(msg_in) = Message::parse_from_bytes(&bytes) {
-                    if let Some(message::Union::PublicKey(pk)) = msg_in.union {
-                        if pk.asymmetric_value.len() == box_::PUBLICKEYBYTES {
-                            stream.set_key(tcp::Encrypt::decode(
-                                &pk.symmetric_value,
-                                &pk.asymmetric_value,
-                                &our_sk_b,
-                            )?);
-                        } else if pk.asymmetric_value.is_empty() {
-                            Config::set_key_confirmed(false);
-                            log::info!("Force to update pk");
-                        } else {
-                            bail!("Handshake failed: invalid public sign key length from peer");
-                        }
-                    } else {
-                        log::error!("Handshake failed: invalid message type");
-                    }
-                } else {
-                    bail!("Handshake failed: invalid message format");
-                }
-            }
-            None => {
-                bail!("Failed to receive public key");
-            }
+    // Admitted before the identity handshake, so a peer that stalls in it, or after it without
+    // logging in, holds its place the whole time; an address over its share is turned away.
+    let Some(unauthorized) = admit_unauthorized(id, addr.ip()) else {
+        bail!("too many unauthenticated connections from {}", addr.ip());
+    };
+    // Before the handshake, so its read is bounded too; lifted again at authorization.
+    stream.set_max_packet_length(MAX_UNAUTHORIZED_MESSAGE);
+    tokio::select! {
+        handshake = identity_handshake(&mut stream, secure) => handshake?,
+        _ = unauthorized.evicted() => {
+            bail!("evicted to make room for a newer unauthenticated connection");
         }
     }
 
@@ -260,20 +250,116 @@ pub async fn create_tcp_connection(
         stream,
         id,
         Arc::downgrade(&server),
-        control_permissions,
+        meta,
+        unauthorized,
     )
     .await;
     Ok(())
 }
 
-pub async fn accept_connection(
+/// Our signed identity goes out and, when `secure`, the controller's reply keys `stream`.
+/// Separate so it can be raced against the connection's eviction.
+async fn identity_handshake(stream: &mut Stream, secure: bool) -> ResultType<()> {
+    let (sk, pk) = Config::get_key_pair();
+    if secure && pk.len() == sign::PUBLICKEYBYTES && sk.len() == sign::SECRETKEYBYTES {
+        let mut sk_ = [0u8; sign::SECRETKEYBYTES];
+        sk_[..].copy_from_slice(&sk);
+        let sk = sign::SecretKey(sk_);
+        let mut msg_out = Message::new();
+        let (our_pk_b, our_sk_b) = box_::gen_keypair();
+        // On a WebRTC transport, bind our DTLS certificate fingerprint to our signed identity so
+        // the controller can verify the DTLS channel it negotiated actually terminates at us
+        // (not a rendezvous/relay that swapped the SDP fingerprint). Empty on other transports.
+        // Fail immediately on WebRTC if the local fingerprint is unavailable: signing "" would
+        // only make the client fail-closed after a wasted round-trip.
+        let dtls_fingerprint = stream.dtls_fingerprint(true).await.unwrap_or_default();
+        if stream.is_webrtc() && dtls_fingerprint.is_empty() {
+            bail!("WebRTC local DTLS fingerprint unavailable");
+        }
+        // A WebRTC stream is encrypted by DTLS and takes no stream key of its own, split or
+        // not, so what it advertises is what it runs: 0. Saying 1 there would have a future
+        // controller that splits keys on WebRTC agree on a version this side never applies.
+        let advertised = if stream.is_webrtc() {
+            0
+        } else {
+            tcp::KX_VERSION_LATEST
+        };
+        msg_out.set_signed_id(SignedId {
+            id: sign::sign(
+                &IdPk {
+                    id: Config::get_id(),
+                    pk: Bytes::from(our_pk_b.0.to_vec()),
+                    dtls_fingerprint,
+                    kx_version: advertised,
+                    ..Default::default()
+                }
+                .write_to_bytes()
+                .unwrap_or_default(),
+                &sk,
+            )
+            .into(),
+            ..Default::default()
+        });
+        timeout(CONNECT_TIMEOUT, stream.send(&msg_out)).await??;
+        match timeout(CONNECT_TIMEOUT, stream.next()).await? {
+            Some(res) => {
+                let bytes = res?;
+                if let Ok(msg_in) = Message::parse_from_bytes(&bytes) {
+                    if let Some(message::Union::PublicKey(pk)) = msg_in.union {
+                        if pk.asymmetric_value.len() == box_::PUBLICKEYBYTES {
+                            let key = tcp::Encrypt::decode(
+                                &pk.symmetric_value,
+                                &pk.asymmetric_value,
+                                &our_sk_b,
+                            )?;
+                            if pk.kx_version > advertised {
+                                bail!(
+                                    "Handshake failed: key exchange version {} not offered, {} was",
+                                    pk.kx_version,
+                                    advertised
+                                );
+                            }
+                            stream.set_negotiated_key(
+                                key,
+                                false,
+                                &tcp::KxTranscript {
+                                    initiator_pk: &pk.asymmetric_value,
+                                    responder_pk: &our_pk_b.0,
+                                    advertised,
+                                    picked: pk.kx_version,
+                                },
+                            )?;
+                        } else if pk.asymmetric_value.is_empty() {
+                            Config::set_key_confirmed(false);
+                            log::info!("Force to update pk");
+                        } else {
+                            bail!("Handshake failed: invalid public sign key length from peer");
+                        }
+                    } else {
+                        log::error!("Handshake failed: invalid message type");
+                    }
+                } else {
+                    bail!("Handshake failed: invalid message format");
+                }
+            }
+            None => {
+                bail!("Failed to receive public key");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) async fn accept_connection(
     server: ServerPtr,
     socket: Stream,
     peer_addr: SocketAddr,
     secure: bool,
-    control_permissions: Option<ControlPermissions>,
+    meta: ConnectionMeta,
+    slot: crate::rendezvous_mediator::PunchSlot,
 ) {
-    if let Err(err) = accept_connection_(server, socket, secure, control_permissions).await {
+    if let Err(err) = accept_connection_(server, socket, secure, meta, slot).await {
         log::warn!("Failed to accept connection from {}: {}", peer_addr, err);
     }
 }
@@ -285,7 +371,7 @@ pub async fn create_relay_connection(
     peer_addr: SocketAddr,
     secure: bool,
     ipv4: bool,
-    control_permissions: Option<ControlPermissions>,
+    meta: ConnectionMeta,
 ) {
     if let Err(err) = create_relay_connection_(
         server,
@@ -294,7 +380,7 @@ pub async fn create_relay_connection(
         peer_addr,
         secure,
         ipv4,
-        control_permissions,
+        meta,
     )
     .await
     {
@@ -314,7 +400,7 @@ async fn create_relay_connection_(
     peer_addr: SocketAddr,
     secure: bool,
     ipv4: bool,
-    control_permissions: Option<ControlPermissions>,
+    meta: ConnectionMeta,
 ) -> ResultType<()> {
     let mut stream = socket_client::connect_tcp(
         socket_client::ipv4_to_ipv6(crate::check_port(relay_server, RELAY_PORT), ipv4),
@@ -329,7 +415,7 @@ async fn create_relay_connection_(
         ..Default::default()
     });
     stream.send(&msg_out).await?;
-    create_tcp_connection(server, stream, peer_addr, secure, control_permissions).await?;
+    create_tcp_connection(server, stream, peer_addr, secure, meta).await?;
     Ok(())
 }
 
@@ -353,15 +439,13 @@ impl Server {
         }
     }
 
-    pub fn try_add_primay_video_service(&mut self) {
-        let primary_video_service_name = video_service::get_service_name(
-            VideoSource::Monitor,
-            *display_service::PRIMARY_DISPLAY_IDX,
-        );
-        if !self.contains(&primary_video_service_name) {
+    pub fn try_add_monitor_service(&mut self, display_idx: usize) {
+        let monitor_service_name =
+            video_service::get_service_name(VideoSource::Monitor, display_idx);
+        if !self.contains(&monitor_service_name) {
             self.add_service(Box::new(video_service::new(
                 VideoSource::Monitor,
-                *display_service::PRIMARY_DISPLAY_IDX,
+                display_idx,
             )));
         }
     }
@@ -377,14 +461,17 @@ impl Server {
         self.connections.insert(conn.id(), conn);
     }
 
-    pub fn add_connection(&mut self, conn: ConnInner, noperms: &Vec<&'static str>) {
-        let primary_video_service_name = video_service::get_service_name(
-            VideoSource::Monitor,
-            *display_service::PRIMARY_DISPLAY_IDX,
-        );
+    pub fn add_monitor_connection(
+        &mut self,
+        conn: ConnInner,
+        noperms: &Vec<&'static str>,
+        display_idx: usize,
+    ) {
+        let monitor_service_name =
+            video_service::get_service_name(VideoSource::Monitor, display_idx);
         for s in self.services.values() {
             let name = s.name();
-            if Self::is_video_service_name(&name) && name != primary_video_service_name {
+            if Self::is_video_service_name(&name) && name != monitor_service_name {
                 continue;
             }
             if !noperms.contains(&(&name as _)) {
@@ -579,11 +666,13 @@ pub async fn start_server(is_server: bool, no_server: bool) {
             log::info!("XAUTHORITY={:?}", std::env::var("XAUTHORITY"));
         }
         #[cfg(windows)]
-        hbb_common::platform::windows::start_cpu_performance_monitor();
+        base::platform::windows::start_cpu_performance_monitor();
     });
 
     if is_server {
         crate::common::set_server_running(true);
+        // 公司定制：一次性配置迁移，见 custom_settings.rs
+        crate::custom_settings::migrate_once();
         std::thread::spawn(move || {
             if let Err(err) = crate::ipc::start("") {
                 log::error!("Failed to start ipc: {}", err);
@@ -594,13 +683,32 @@ pub async fn start_server(is_server: bool, no_server: bool) {
                 std::process::exit(-1);
             }
         });
+        // Warm the DRM availability cache before any client connects, so the first connection does
+        // not race a cold `_drm` probe and ship an empty display list ("No displays" + retry).
+        // X11 is skipped -- probing there makes the root service open DRM readers for a path this
+        // session can never take -- but that decision belongs to `warm_availability`, which already
+        // makes it, and NOT to this call site. Deciding it here is the same one-shot-at-startup
+        // mistake the pre-warm had: `is_x11()` answers "x11" whenever loginctl cannot yet name the
+        // seat0 session, which during a boot is exactly when this runs, and nothing revisits it --
+        // so a Wayland host that came up slowly skipped the warm for the life of the process and
+        // got back the cold-probe "No displays" symptom the warm exists to remove.
+        #[cfg(all(target_os = "linux", feature = "drm"))]
+        if let Err(err) = std::thread::Builder::new()
+            .name("drm-warm".into())
+            .spawn(drm_capturer::warm_availability)
+        {
+            // Same reason as the root service's startup threads: `thread::spawn` panics on EAGAIN
+            // and that would abort `start_server`. Skipping the warm costs the first session the
+            // cold probe, which is what happened before the warm existed.
+            log::warn!("drm: could not spawn the availability warm ({err}); skipping it");
+        }
         input_service::fix_key_down_timeout_loop();
         #[cfg(target_os = "linux")]
         if input_service::wayland_use_uinput() {
             allow_err!(input_service::setup_uinput(0, 1920, 0, 1080).await);
         }
         #[cfg(any(target_os = "macos", target_os = "linux"))]
-        tokio::spawn(async { sync_and_watch_config_dir().await });
+        wait_initial_config_sync().await;
         #[cfg(target_os = "windows")]
         crate::platform::try_kill_broker();
         #[cfg(feature = "hwcodec")]
@@ -685,19 +793,49 @@ pub async fn start_ipc_url_server() {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-async fn sync_and_watch_config_dir() {
+async fn wait_initial_config_sync() {
     if crate::platform::is_root() {
         return;
     }
 
+    // Non-server process should not block startup, but still keeps background sync/watch alive.
+    if !crate::is_server() {
+        tokio::spawn(async move {
+            sync_and_watch_config_dir(None).await;
+        });
+        return;
+    }
+
+    let (sync_done_tx, mut sync_done_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        sync_and_watch_config_dir(Some(sync_done_tx)).await;
+    });
+
+    // Server process waits up to N seconds for initial root->local sync to reduce stale-start window.
+    tokio::select! {
+        _ = &mut sync_done_rx => {
+        }
+        _ = tokio::time::sleep(Duration::from_secs(CONFIG_SYNC_INITIAL_WAIT_SECS)) => {
+            log::warn!(
+                "timed out waiting {}s for initial config sync, continue startup and keep syncing in background",
+                CONFIG_SYNC_INITIAL_WAIT_SECS
+            );
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+async fn sync_and_watch_config_dir(sync_done_tx: Option<tokio::sync::oneshot::Sender<()>>) {
     let mut cfg0 = (Config::get(), Config2::get());
     let mut synced = false;
+    let mut is_root_config_empty = false;
+    let mut sync_done_tx = sync_done_tx;
     let tries = if crate::is_server() { 30 } else { 3 };
     log::debug!("#tries of ipc service connection: {}", tries);
     use hbb_common::sleep;
     for i in 1..=tries {
         sleep(i as f32 * CONFIG_SYNC_INTERVAL_SECS).await;
-        match crate::ipc::connect(1000, "_service").await {
+        match crate::ipc::connect_service(1000).await {
             Ok(mut conn) => {
                 if !synced {
                     if conn.send(&Data::SyncConfig(None)).await.is_ok() {
@@ -706,6 +844,8 @@ async fn sync_and_watch_config_dir() {
                                 Data::SyncConfig(Some(configs)) => {
                                     let (config, config2) = *configs;
                                     let _chk = crate::ipc::CheckIfRestart::new();
+                                    #[cfg(target_os = "macos")]
+                                    let _chk_pk = crate::CheckIfResendPk::new();
                                     if !config.is_empty() {
                                         if cfg0.0 != config {
                                             cfg0.0 = config.clone();
@@ -717,24 +857,47 @@ async fn sync_and_watch_config_dir() {
                                             Config2::set(config2);
                                             log::info!("sync config2 from root");
                                         }
+                                    } else {
+                                        // only on macos, because this issue was only reproduced on macos
+                                        #[cfg(target_os = "macos")]
+                                        {
+                                            // root config is empty, mark for sync in watch loop
+                                            // to prevent root from generating a new config on login screen
+                                            is_root_config_empty = true;
+                                        }
                                     }
                                     synced = true;
+                                    // Notify startup waiter once initial sync phase finishes successfully.
+                                    if let Some(tx) = sync_done_tx.take() {
+                                        let _ = tx.send(());
+                                    }
                                 }
                                 _ => {}
                             };
                         };
+                    }
+                    if !synced {
+                        log::warn!(
+                            "initial config sync from root failed, reconnecting to ipc_service"
+                        );
+                        continue;
                     }
                 }
 
                 loop {
                     sleep(CONFIG_SYNC_INTERVAL_SECS).await;
                     let cfg = (Config::get(), Config2::get());
-                    if cfg != cfg0 {
-                        log::info!("config updated, sync to root");
+                    let should_sync = cfg != cfg0 || (is_root_config_empty && !cfg.0.is_empty());
+                    if should_sync {
+                        if is_root_config_empty {
+                            log::info!("root config is empty, sync our config to root");
+                        } else {
+                            log::info!("config updated, sync to root");
+                        }
                         match conn.send(&Data::SyncConfig(Some(cfg.clone().into()))).await {
                             Err(e) => {
                                 log::error!("sync config to root failed: {}", e);
-                                match crate::ipc::connect(1000, "_service").await {
+                                match crate::ipc::connect_service(1000).await {
                                     Ok(mut _conn) => {
                                         conn = _conn;
                                         log::info!("reconnected to ipc_service");
@@ -745,6 +908,7 @@ async fn sync_and_watch_config_dir() {
                             _ => {
                                 cfg0 = cfg;
                                 conn.next_timeout(1000).await.ok();
+                                is_root_config_empty = false;
                             }
                         }
                     }
@@ -754,6 +918,10 @@ async fn sync_and_watch_config_dir() {
                 log::info!("#{} try: failed to connect to ipc_service", i);
             }
         }
+    }
+    // Notify startup waiter even when initial sync is skipped/failed, to avoid unnecessary waiting.
+    if let Some(tx) = sync_done_tx.take() {
+        let _ = tx.send(());
     }
     log::warn!("skipped config sync");
 }

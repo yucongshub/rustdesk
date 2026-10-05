@@ -4,14 +4,13 @@ use super::*;
 use crate::input::*;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use crate::whiteboard;
+use base::message_proto::{
+    pointer_device_event::Union::TouchEvent, touch_event::Union::ScaleUpdate,
+};
 #[cfg(target_os = "macos")]
 use dispatch::Queue;
 use enigo::{Enigo, Key, KeyboardControllable, MouseButton, MouseControllable};
-use hbb_common::{
-    get_time,
-    message_proto::{pointer_device_event::Union::TouchEvent, touch_event::Union::ScaleUpdate},
-    protobuf::EnumOrUnknown,
-};
+use hbb_common::{get_time, protobuf::EnumOrUnknown};
 use rdev::{self, EventType, Key as RdevKey, KeyCode, RawKey};
 #[cfg(target_os = "macos")]
 use rdev::{CGEventSourceStateID, CGEventTapLocation, VirtualInput};
@@ -43,6 +42,7 @@ struct StateCursor {
 impl super::service::Reset for StateCursor {
     fn reset(&mut self) {
         *self = Default::default();
+        CURSOR_SHAPES.lock().unwrap().clear();
         crate::platform::reset_input_cache();
         fix_key_down_timeout(true);
     }
@@ -110,6 +110,10 @@ struct Input {
 }
 
 const KEY_CHAR_START: u64 = 9999;
+
+// XKB keycode for Insert key (evdev KEY_INSERT code 110 + 8 for XKB offset)
+#[cfg(target_os = "linux")]
+const XKB_KEY_INSERT: u16 = evdev::Key::KEY_INSERT.code() + 8;
 
 #[derive(Clone, Default)]
 pub struct MouseCursorSub {
@@ -392,21 +396,72 @@ fn run_cursor(sp: MouseCursorService, state: &mut StateCursor) -> ResultType<()>
     if let Some(hcursor) = crate::get_cursor()? {
         if hcursor != state.hcursor {
             let msg;
+            // On the DRM path get_cursor_data() may return a snapshot whose id has advanced past the
+            // requested `hcursor` (it returns the latest hardware cursor); file it in the cache AND
+            // record state.hcursor under the id ACTUALLY served, so a later reappearance of that exact
+            // shape dedupes correctly instead of being suppressed. Everything below is fully
+            // gated on the drm feature, so the drm-off build stays byte-identical to upstream.
+            #[cfg(all(target_os = "linux", feature = "drm"))]
+            let mut drm_served_id = hcursor;
             if let Some(cached) = state.cached_cursor_data.get(&hcursor) {
                 super::log::trace!("Cursor data cached, hcursor: {}", hcursor);
                 msg = cached.clone();
             } else {
-                let mut data = crate::get_cursor_data(hcursor)?;
-                data.colors = hbb_common::compress::compress(&data.colors[..]).into();
-                let mut tmp = Message::new();
-                tmp.set_cursor_data(data);
-                msg = Arc::new(tmp);
-                state.cached_cursor_data.insert(hcursor, msg.clone());
-                super::log::trace!("Cursor data updated, hcursor: {}", hcursor);
+                let data = crate::get_cursor_data(hcursor)?;
+                // File the shape under the id ACTUALLY served, not the one requested. Deliberately a
+                // NEW name rather than shadowing `hcursor`: the insert below reads as the requested
+                // id everywhere else in this function, and a cfg-gated shadow would make the two
+                // builds disagree about what that line means.
+                #[cfg(all(target_os = "linux", feature = "drm"))]
+                let served_id = data.id;
+                #[cfg(all(target_os = "linux", feature = "drm"))]
+                {
+                    drm_served_id = served_id;
+                }
+                #[cfg(all(target_os = "linux", feature = "drm"))]
+                let cache_key = served_id;
+                #[cfg(not(all(target_os = "linux", feature = "drm")))]
+                let cache_key = hcursor;
+                msg = cursor_shape_message(data, hbb_common::compress::compress);
+                // A DRM cursor id is derived from the shape's pixels plus geometry, so an animated
+                // pointer mints a new id on every shape change and this map would grow for the life
+                // of the service, each entry pinning a compressed cursor message. (Upstream's X11
+                // ids come from a small set of XFixes serials, so the map is effectively bounded
+                // there -- which is why the ceiling is gated and the stock build stays untouched.)
+                // Past the ceiling, drop the map and start over: the next request for any evicted
+                // shape just recompresses it, and the ceiling comfortably covers every static shape
+                // plus a generous animation window.
+                #[cfg(all(target_os = "linux", feature = "drm"))]
+                {
+                    const CURSOR_CACHE_MAX: usize = 64;
+                    if state.cached_cursor_data.len() >= CURSOR_CACHE_MAX {
+                        state.cached_cursor_data.clear();
+                        CURSOR_SHAPES.lock().unwrap().clear();
+                        // The shape being sent was kept above; keep it past the clear.
+                        shared_cursor_shape(msg.clone());
+                    }
+                }
+                limit_cursor_handles(&mut state.cached_cursor_data, &msg);
+                // A macOS seed marks a change, never the same one twice: filing it would only
+                // fill the map.
+                #[cfg(not(target_os = "macos"))]
+                state.cached_cursor_data.insert(cache_key, msg.clone());
+                super::log::trace!("Cursor data updated, hcursor: {}", cache_key);
             }
-            state.hcursor = hcursor;
-            sp.send_shared(msg.clone());
-            state.cursor_data = msg;
+            #[cfg(not(all(target_os = "linux", feature = "drm")))]
+            {
+                state.hcursor = hcursor;
+            }
+            #[cfg(all(target_os = "linux", feature = "drm"))]
+            {
+                state.hcursor = drm_served_id;
+            }
+            // A new handle or seed for the shape already shown changes nothing a controller sees;
+            // a shape is one message however many handles name it.
+            if !Arc::ptr_eq(&msg, &state.cursor_data) {
+                sp.send_shared(msg.clone());
+                state.cursor_data = msg;
+            }
         }
     }
     sp.snapshot(|sps| {
@@ -451,6 +506,101 @@ lazy_static::lazy_static! {
     // Track connections that are currently using relative mouse movement.
     // Used to disable whiteboard/cursor display for all events while in relative mode.
     static ref RELATIVE_MOUSE_CONNS: Arc<Mutex<std::collections::HashSet<i32>>> = Default::default();
+}
+
+lazy_static::lazy_static! {
+    // Every shape the service has sent, by content id, for a controller that asks for one
+    // again. A shape under several handles is one message here, shared with `cached_cursor_data`,
+    // and cleared with it; see `limit_cursor_handles` for the ceilings. A shape dropped is
+    // rebuilt here the next time it is shown, in `run_cursor`, before any connection sends its
+    // `cursor_id`: whatever a controller has just been told to show, it can ask for.
+    static ref CURSOR_SHAPES: Mutex<CursorShapes> = Default::default();
+}
+
+/// The shapes sent, by content id, and the bytes they hold compressed.
+#[derive(Default)]
+struct CursorShapes {
+    shapes: HashMap<u64, Arc<Message>>,
+    bytes: usize,
+}
+
+impl CursorShapes {
+    fn get(&self, id: &u64) -> Option<&Arc<Message>> {
+        self.shapes.get(id)
+    }
+
+    fn clear(&mut self) {
+        self.shapes.clear();
+        self.bytes = 0;
+    }
+
+    /// The message kept for this shape, `msg` if there was none.
+    fn keep(&mut self, cd: &CursorData, msg: &Arc<Message>) -> Arc<Message> {
+        let bytes = &mut self.bytes;
+        self.shapes
+            .entry(cd.id)
+            .or_insert_with(|| {
+                *bytes += cd.colors.len();
+                msg.clone()
+            })
+            .clone()
+    }
+}
+
+/// The message for a shape the platform gave, named by content, so the per-connection send sends
+/// a shape once however many handles the platform gives it; see
+/// `is_peer_naming_cursors_by_content`. A shape sent before, under any handle, is reused without
+/// being compressed again.
+fn cursor_shape_message(
+    mut data: CursorData,
+    compress: impl FnOnce(&[u8]) -> Vec<u8>,
+) -> Arc<Message> {
+    data.id = crate::cursor_content_id(data.width, data.height, data.hotx, data.hoty, &data.colors);
+    if let Some(msg) = cursor_data_message(data.id) {
+        return msg;
+    }
+    data.colors = compress(&data.colors[..]).into();
+    let mut msg = Message::new();
+    msg.set_cursor_data(data);
+    shared_cursor_shape(Arc::new(msg))
+}
+
+// A platform may mint a new handle each time it shows a shape (Chrome, Electron), so the handles
+// filed would grow for the life of the service, each entry a u64 and an Arc even when every one
+// names the same shape. Past this many handles, or this many bytes of compressed shapes, however
+// few, the handles and the shapes start over together: a handle shown again is captured and named
+// again. macOS files no handles, so there the bytes alone bound the shapes.
+const CURSOR_HANDLES_MAX: usize = 4096;
+const CURSOR_SHAPES_BYTES_MAX: usize = 32 << 20;
+
+fn limit_cursor_handles(handles: &mut HashMap<u64, Arc<Message>>, sending: &Arc<Message>) {
+    if handles.len() >= CURSOR_HANDLES_MAX
+        || CURSOR_SHAPES.lock().unwrap().bytes >= CURSOR_SHAPES_BYTES_MAX
+    {
+        handles.clear();
+        CURSOR_SHAPES.lock().unwrap().clear();
+        // The shape being sent was kept; keep it past the clear.
+        shared_cursor_shape(sending.clone());
+    }
+}
+
+/// The message already kept for this shape if there is one, so every handle for it shares it.
+fn shared_cursor_shape(msg: Arc<Message>) -> Arc<Message> {
+    let Some(message::Union::CursorData(cd)) = &msg.union else {
+        return msg;
+    };
+    CURSOR_SHAPES.lock().unwrap().keep(cd, &msg)
+}
+
+/// The CursorData message of a shape the service has sent, for `Misc::request_cursor_data`.
+pub fn cursor_data_message(id: u64) -> Option<Arc<Message>> {
+    CURSOR_SHAPES.lock().unwrap().get(&id).cloned()
+}
+
+#[cfg(target_os = "linux")]
+lazy_static::lazy_static! {
+    static ref WAYLAND_CLIPBOARD_INPUT_RECORDS: Arc<Mutex<Vec<(Instant, String)>>> =
+        Default::default();
 }
 
 #[inline]
@@ -610,17 +760,22 @@ pub async fn setup_uinput(minx: i32, maxx: i32, miny: i32, maxy: i32) -> ResultT
     let mouse = super::uinput::client::UInputMouse::new().await?;
     log::info!("UInput mouse created");
 
-    ENIGO
-        .lock()
-        .unwrap()
-        .set_custom_keyboard(Box::new(keyboard));
-    ENIGO.lock().unwrap().set_custom_mouse(Box::new(mouse));
+    let mut en = ENIGO.lock().unwrap();
+    // enigo guessed x11 once at construction, which is what a Wayland greeter reads as, and
+    // then routes the devices installed below to a null xdo that drops everything silently.
+    // Reaching here means `wayland_use_uinput()` was true, so this states a fact.
+    en.set_is_x11(false);
+    // One lock for both, so there is no window where the keyboard is custom and the mouse is not.
+    en.set_custom_keyboard(Box::new(keyboard));
+    en.set_custom_mouse(Box::new(mouse));
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
 pub async fn setup_rdp_input() -> ResultType<(), Box<dyn std::error::Error>> {
     let mut en = ENIGO.lock()?;
+    // Same as `setup_uinput`: the caller is gated on `wayland_use_rdp_input()`.
+    en.set_is_x11(false);
     let rdp_info_lock = RDP_SESSION_INFO.lock()?;
     let rdp_info = rdp_info_lock.as_ref().ok_or("RDP session is None")?;
 
@@ -651,20 +806,22 @@ pub async fn setup_rdp_input() -> ResultType<(), Box<dyn std::error::Error>> {
 pub async fn update_mouse_resolution(minx: i32, maxx: i32, miny: i32, maxy: i32) -> ResultType<()> {
     set_uinput_resolution(minx, maxx, miny, maxy).await?;
 
-    std::thread::spawn(|| {
+    // Confirm the device adopted the new range before the caller caches it.
+    // spawn_blocking because ENIGO is a std Mutex and send_refresh blocks on IPC.
+    tokio::task::spawn_blocking(move || {
         if let Some(mouse) = ENIGO.lock().unwrap().get_custom_mouse() {
             if let Some(mouse) = mouse
                 .as_mut_any()
                 .downcast_mut::<super::uinput::client::UInputMouse>()
             {
-                allow_err!(mouse.send_refresh());
-            } else {
-                log::error!("failed downcast uinput mouse");
+                return mouse.send_refresh();
             }
+            bail!("failed to downcast custom mouse to UInputMouse");
         }
-    });
-
-    Ok(())
+        // No custom mouse: nothing to refresh.
+        Ok(())
+    })
+    .await?
 }
 
 #[cfg(target_os = "linux")]
@@ -805,7 +962,7 @@ fn record_key_is_control_key(record_key: u64) -> bool {
 
 #[inline]
 fn record_key_is_chr(record_key: u64) -> bool {
-    record_key < KEY_CHAR_START
+    record_key >= KEY_CHAR_START
 }
 
 #[inline]
@@ -918,6 +1075,77 @@ fn fix_modifiers(modifiers: &[EnumOrUnknown<ControlKey>], en: &mut Enigo, ck: i3
     if ck != ControlKey::RWin.value() {
         fix_modifier(modifiers, ControlKey::Meta, Key::RWin, en);
     }
+}
+
+/// The last ABSOLUTE peer-injected pointer position, in the post-remap uinput layout space, with
+/// when it was injected, a sequence number and the wayland snapshot generation it was mapped
+/// against. Deliberately NOT `LATEST_PEER_INPUT_CURSOR`: its relative arm stores
+/// `get_cursor_pos()`, an X-server coordinate that never went through the layout remap, and the
+/// DRM cursor calibration subtracts a cursor-plane position from this, so the two spaces must
+/// match. Only the uinput absolute path writes here.
+#[cfg(all(target_os = "linux", feature = "drm"))]
+static LATEST_PEER_ABS_POS: std::sync::Mutex<
+    Option<((i32, i32), std::time::Instant, u64, u64, u64)>,
+> = std::sync::Mutex::new(None);
+#[cfg(all(target_os = "linux", feature = "drm"))]
+static PEER_ABS_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// One absolute peer sample, as the calibration reads it.
+#[cfg(all(target_os = "linux", feature = "drm"))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PeerAbsSample {
+    pub pos: (i32, i32),
+    pub age_ms: u64,
+    /// Distinct per injected move. Two measurements taken against the same sample are not
+    /// independent, whatever the cursor plane did in between.
+    pub seq: u64,
+    /// The layout generation the point was mapped against.
+    pub gen: u64,
+    /// The input-mapping epoch at injection: a sample from before a range adoption was mapped by
+    /// the old range. See `display_service::input_map_epoch`.
+    pub map_epoch: u64,
+}
+
+/// The peer moved the pointer to an absolute, post-remap position. Called under the ENIGO guard
+/// of the move, which an adoption also needs for its refresh: a move stamped with the count of an
+/// adoption was injected after that adoption's refresh.
+#[cfg(all(target_os = "linux", feature = "drm"))]
+pub(crate) fn note_peer_absolute_move(x: i32, y: i32) {
+    let seq = PEER_ABS_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+    let gen = scrap::wayland::display::wayland_snapshot_generation();
+    let map_epoch = super::display_service::input_map_epoch();
+    *LATEST_PEER_ABS_POS.lock().unwrap() =
+        Some(((x, y), std::time::Instant::now(), seq, gen, map_epoch));
+}
+
+/// The pointer moved by a path that has no post-remap absolute position to offer: a relative
+/// delta from the peer, or a move this process made on its own. The last sample no longer says
+/// where the pointer is; forget it, the next absolute move restores it.
+#[cfg(all(target_os = "linux", feature = "drm"))]
+pub(crate) fn note_pointer_moved_without_absolute_sample() {
+    *LATEST_PEER_ABS_POS.lock().unwrap() = None;
+}
+
+/// A move this process makes on its own. The forget runs once `lock` returned the guard the peer
+/// move records its sample under, so no peer move lands between the forget and this move and
+/// leaves its sample describing a pointer that has moved since.
+#[cfg(all(target_os = "linux", feature = "drm"))]
+fn forget_sample_and_move<G>(lock: impl FnOnce() -> G, move_to: impl FnOnce(G)) {
+    let guard = lock();
+    note_pointer_moved_without_absolute_sample();
+    move_to(guard);
+}
+
+#[cfg(all(target_os = "linux", feature = "drm"))]
+pub(crate) fn last_peer_abs_sample() -> Option<PeerAbsSample> {
+    let (pos, at, seq, gen, map_epoch) = (*LATEST_PEER_ABS_POS.lock().unwrap())?;
+    Some(PeerAbsSample {
+        pos,
+        age_ms: at.elapsed().as_millis() as u64,
+        seq,
+        gen,
+        map_epoch,
+    })
 }
 
 // Update time to avoid send cursor position event to the peer.
@@ -1088,12 +1316,30 @@ pub fn handle_mouse_simulation_(evt: &MouseEvent, conn: i32) {
         MOUSE_TYPE_MOVE => {
             // Switching back to absolute movement implicitly disables relative mouse mode.
             set_relative_mouse_active(conn, false);
-            en.mouse_move_to(evt.x, evt.y);
+            // On Wayland with uinput, the client sends coordinates in the layout it was
+            // told at session init. If the compositor has since moved a monitor, correct
+            // them onto the current layout. https://github.com/rustdesk/rustdesk/issues/15601
+            #[cfg(target_os = "linux")]
+            let uinput = wayland_use_uinput();
+            #[cfg(target_os = "linux")]
+            let (mx, my) = if uinput {
+                super::display_service::remap_wayland_uinput_coord(evt.x, evt.y)
+            } else {
+                (evt.x, evt.y)
+            };
+            #[cfg(not(target_os = "linux"))]
+            let (mx, my) = (evt.x, evt.y);
+            en.mouse_move_to(mx, my);
+            // Only the uinput point is in the layout space the calibration measures in.
+            #[cfg(all(target_os = "linux", feature = "drm"))]
+            if uinput {
+                note_peer_absolute_move(mx, my);
+            }
             *LATEST_PEER_INPUT_CURSOR.lock().unwrap() = Input {
                 conn,
                 time: get_time(),
-                x: evt.x,
-                y: evt.y,
+                x: mx,
+                y: my,
             };
         }
         // MOUSE_TYPE_MOVE_RELATIVE: Relative mouse movement for gaming/3D applications.
@@ -1105,8 +1351,16 @@ pub fn handle_mouse_simulation_(evt: &MouseEvent, conn: i32) {
             // Clamp delta to prevent extreme/malicious values from reaching OS APIs.
             // This matches the Flutter client's kMaxRelativeMouseDelta constant.
             const MAX_RELATIVE_MOUSE_DELTA: i32 = 10000;
-            let dx = evt.x.clamp(-MAX_RELATIVE_MOUSE_DELTA, MAX_RELATIVE_MOUSE_DELTA);
-            let dy = evt.y.clamp(-MAX_RELATIVE_MOUSE_DELTA, MAX_RELATIVE_MOUSE_DELTA);
+            let dx = evt
+                .x
+                .clamp(-MAX_RELATIVE_MOUSE_DELTA, MAX_RELATIVE_MOUSE_DELTA);
+            let dy = evt
+                .y
+                .clamp(-MAX_RELATIVE_MOUSE_DELTA, MAX_RELATIVE_MOUSE_DELTA);
+            // The absolute sample stops describing the pointer the moment a delta lands. Drop it
+            // BEFORE the move, so no frame in between can measure the plane against it.
+            #[cfg(all(target_os = "linux", feature = "drm"))]
+            note_pointer_moved_without_absolute_sample();
             en.mouse_move_relative(dx, dy);
             // Get actual cursor position after relative movement for tracking
             if let Some((x, y)) = crate::get_cursor_pos() {
@@ -1465,18 +1719,24 @@ fn map_keyboard_mode(evt: &KeyEvent) {
     // Wayland
     #[cfg(target_os = "linux")]
     if !crate::platform::linux::is_x11() {
-        let mut en = ENIGO.lock().unwrap();
-        let code = evt.chr() as u16;
-
-        if evt.down {
-            en.key_down(enigo::Key::Raw(code)).ok();
-        } else {
-            en.key_up(enigo::Key::Raw(code));
-        }
+        wayland_send_raw_key(evt.chr() as u16, evt.down);
         return;
     }
 
     sim_rdev_rawkey_position(evt.chr() as _, evt.down);
+}
+
+/// Send raw keycode on Wayland via the active backend (uinput or RemoteDesktop portal).
+/// The keycode is expected to be a Linux keycode (evdev code + 8 for X11 compatibility).
+#[cfg(target_os = "linux")]
+#[inline]
+fn wayland_send_raw_key(code: u16, down: bool) {
+    let mut en = ENIGO.lock().unwrap();
+    if down {
+        en.key_down(enigo::Key::Raw(code)).ok();
+    } else {
+        en.key_up(enigo::Key::Raw(code));
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1497,6 +1757,27 @@ fn get_control_key_value(key_event: &KeyEvent) -> i32 {
     } else {
         -1
     }
+}
+
+#[inline]
+fn has_hotkey_modifiers(key_event: &KeyEvent) -> bool {
+    key_event.modifiers.iter().any(|ck| {
+        let v = ck.value();
+        v == ControlKey::Control.value()
+            || v == ControlKey::RControl.value()
+            || v == ControlKey::Meta.value()
+            || v == ControlKey::RWin.value()
+            || {
+                #[cfg(any(target_os = "windows", target_os = "linux"))]
+                {
+                    v == ControlKey::Alt.value() || v == ControlKey::RAlt.value()
+                }
+                #[cfg(target_os = "macos")]
+                {
+                    false
+                }
+            }
+    })
 }
 
 fn release_unpressed_modifiers(en: &mut Enigo, key_event: &KeyEvent) {
@@ -1558,7 +1839,44 @@ fn need_to_uppercase(en: &mut Enigo) -> bool {
     get_modifier_state(Key::Shift, en) || get_modifier_state(Key::CapsLock, en)
 }
 
-fn process_chr(en: &mut Enigo, chr: u32, down: bool) {
+fn process_chr(en: &mut Enigo, chr: u32, down: bool, _hotkey: bool) {
+    // On Wayland with uinput mode:
+    // - ASCII printable: input via key events (custom keyboard path, e.g. portal keysym)
+    // - Non-ASCII: input via clipboard paste
+    #[cfg(target_os = "linux")]
+    if !crate::platform::linux::is_x11() && wayland_use_uinput() {
+        // Skip clipboard for hotkeys (Ctrl/Alt/Meta pressed)
+        if !is_hotkey_modifier_pressed(en) {
+            if let Ok(c) = char::try_from(chr) {
+                if is_ascii_printable(c) {
+                    if down {
+                        en.key_down(Key::Layout(c)).ok();
+                    } else {
+                        en.key_up(Key::Layout(c));
+                    }
+                } else if down {
+                    input_char_via_clipboard_server(en, c);
+                }
+            } else {
+                log::warn!(
+                    "Ignore invalid unicode scalar in Wayland+uinput path: {}",
+                    chr
+                );
+            }
+            return;
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    if !_hotkey {
+        if down {
+            if let Ok(chr) = char::try_from(chr) {
+                en.key_sequence(&chr.to_string());
+            }
+        }
+        return;
+    }
+
     let key = char_value_to_key(chr);
 
     if down {
@@ -1578,13 +1896,213 @@ fn process_chr(en: &mut Enigo, chr: u32, down: bool) {
 }
 
 fn process_unicode(en: &mut Enigo, chr: u32) {
+    // On Wayland with uinput mode:
+    // - ASCII printable: input via key sequence (custom keyboard path)
+    // - Non-ASCII: input via clipboard paste
+    #[cfg(target_os = "linux")]
+    if !crate::platform::linux::is_x11() && wayland_use_uinput() {
+        if let Ok(c) = char::try_from(chr) {
+            if is_ascii_printable(c) {
+                en.key_sequence(&c.to_string());
+            } else {
+                input_char_via_clipboard_server(en, c);
+            }
+        }
+        return;
+    }
+
     if let Ok(chr) = char::try_from(chr) {
         en.key_sequence(&chr.to_string());
     }
 }
 
 fn process_seq(en: &mut Enigo, sequence: &str) {
+    // On Wayland with uinput mode:
+    // - pure ASCII printable sequence: input via key sequence (custom keyboard path)
+    // - any non-ASCII present: input whole sequence via clipboard to preserve order
+    #[cfg(target_os = "linux")]
+    if !crate::platform::linux::is_x11() && wayland_use_uinput() {
+        if sequence.chars().all(is_ascii_printable) {
+            en.key_sequence(sequence);
+        } else {
+            input_text_via_clipboard_server(en, sequence);
+        }
+        return;
+    }
+
     en.key_sequence(&sequence);
+}
+
+/// Delay in milliseconds to wait for clipboard to sync on Wayland.
+/// This is an empirical value — Wayland provides no callback or event to confirm
+/// clipboard content has been received by the compositor. Under heavy system load,
+/// this delay may be insufficient, but there is no reliable alternative mechanism.
+#[cfg(target_os = "linux")]
+const CLIPBOARD_SYNC_DELAY_MS: u64 = 50;
+#[cfg(target_os = "linux")]
+const WAYLAND_CLIPBOARD_INPUT_FILTER_WINDOW: Duration = Duration::from_secs(1);
+#[cfg(target_os = "linux")]
+const WAYLAND_CLIPBOARD_INPUT_MAX_RECORDS: usize = 256;
+#[cfg(target_os = "linux")]
+pub(super) const WAYLAND_CLIPBOARD_INPUT_MAX_TEXT_CHARS: usize = 1024;
+
+#[cfg(target_os = "linux")]
+fn cleanup_wayland_clipboard_input_records(records: &mut Vec<(Instant, String)>, now: Instant) {
+    records.retain(|(created_at, _)| {
+        now.saturating_duration_since(*created_at) <= WAYLAND_CLIPBOARD_INPUT_FILTER_WINDOW
+    });
+    let len = records.len();
+    if len > WAYLAND_CLIPBOARD_INPUT_MAX_RECORDS {
+        records.drain(0..(len - WAYLAND_CLIPBOARD_INPUT_MAX_RECORDS));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[inline]
+fn normalize_wayland_clipboard_input_text(text: &str) -> String {
+    text.chars()
+        .take(WAYLAND_CLIPBOARD_INPUT_MAX_TEXT_CHARS)
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+#[inline]
+fn get_wayland_clipboard_input_normalized_text(text: &str) -> Option<String> {
+    let normalized = normalize_wayland_clipboard_input_text(text);
+    if normalized.is_empty() {
+        return None;
+    }
+    Some(normalized)
+}
+
+#[cfg(target_os = "linux")]
+#[inline]
+fn record_wayland_clipboard_input_for_sync_filter(text: &str) -> Option<(Instant, String)> {
+    if text.is_empty() || crate::platform::linux::is_x11() {
+        return None;
+    }
+    let normalized = get_wayland_clipboard_input_normalized_text(text)?;
+    let now = Instant::now();
+    let mut records = WAYLAND_CLIPBOARD_INPUT_RECORDS.lock().unwrap();
+    cleanup_wayland_clipboard_input_records(&mut records, now);
+    records.push((now, normalized.clone()));
+    Some((now, normalized))
+}
+
+#[cfg(target_os = "linux")]
+#[inline]
+fn rollback_wayland_clipboard_input_record(record: (Instant, String)) {
+    let (created_at, normalized) = record;
+    let now = Instant::now();
+    let mut records = WAYLAND_CLIPBOARD_INPUT_RECORDS.lock().unwrap();
+    cleanup_wayland_clipboard_input_records(&mut records, now);
+    if let Some(pos) = records
+        .iter()
+        .rposition(|(record_created_at, record_normalized)| {
+            *record_created_at == created_at && *record_normalized == normalized
+        })
+    {
+        records.remove(pos);
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn is_recent_wayland_clipboard_input(text: &str) -> bool {
+    if text.is_empty() || crate::platform::linux::is_x11() {
+        return false;
+    }
+    let Some(normalized) = get_wayland_clipboard_input_normalized_text(text) else {
+        return false;
+    };
+    let now = Instant::now();
+    let mut records = WAYLAND_CLIPBOARD_INPUT_RECORDS.lock().unwrap();
+    cleanup_wayland_clipboard_input_records(&mut records, now);
+    records
+        .iter()
+        .any(|(_, record_normalized)| record_normalized == &normalized)
+}
+
+/// Internal: Set clipboard content without delay.
+/// Returns true if clipboard was set successfully.
+#[cfg(target_os = "linux")]
+fn set_clipboard_content(text: &str) -> bool {
+    if let Err(e) = crate::clipboard::set_text_clipboard_with_owner_sync(
+        text,
+        crate::clipboard::ClipboardSide::Host,
+    ) {
+        log::error!(
+            "set_clipboard_content: failed to set clipboard with owner marker: {:?}",
+            e
+        );
+        return false;
+    }
+    true
+}
+
+/// Set clipboard content for paste operation (sync version for use in blocking contexts).
+///
+/// Note: The original clipboard content is intentionally NOT restored after paste.
+/// Restoring clipboard could cause race conditions where subsequent keystrokes
+/// might accidentally paste the old clipboard content instead of the intended input.
+/// This trade-off prioritizes input reliability over preserving clipboard state.
+#[cfg(target_os = "linux")]
+#[inline]
+pub(super) fn set_clipboard_for_paste_sync(text: &str) -> bool {
+    let record = record_wayland_clipboard_input_for_sync_filter(text);
+    if !set_clipboard_content(text) {
+        if let Some(record) = record {
+            rollback_wayland_clipboard_input_record(record);
+        }
+        return false;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(CLIPBOARD_SYNC_DELAY_MS));
+    true
+}
+
+/// Check if a character is ASCII printable (0x20-0x7E).
+#[cfg(target_os = "linux")]
+#[inline]
+pub(super) fn is_ascii_printable(c: char) -> bool {
+    c as u32 >= 0x20 && c as u32 <= 0x7E
+}
+
+/// Input a single character via clipboard + Shift+Insert in server process.
+#[cfg(target_os = "linux")]
+#[inline]
+fn input_char_via_clipboard_server(en: &mut Enigo, chr: char) {
+    input_text_via_clipboard_server(en, &chr.to_string());
+}
+
+/// Input text via clipboard + Shift+Insert in server process.
+/// Shift+Insert is more universal than Ctrl+V, works in both GUI apps and terminals.
+///
+/// Note: Clipboard content is NOT restored after paste - see `set_clipboard_for_paste_sync` for rationale.
+#[cfg(target_os = "linux")]
+fn input_text_via_clipboard_server(en: &mut Enigo, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    if !set_clipboard_for_paste_sync(text) {
+        return;
+    }
+
+    // Use ENIGO's custom_keyboard directly to avoid creating new IPC connections
+    // which would cause excessive logging and keyboard device creation/destruction
+    if en.key_down(Key::Shift).is_err() {
+        log::error!("input_text_via_clipboard_server: failed to press Shift, skipping paste");
+        return;
+    }
+    if en.key_down(Key::Raw(XKB_KEY_INSERT)).is_err() {
+        log::error!("input_text_via_clipboard_server: failed to press Insert, releasing Shift");
+        en.key_up(Key::Shift);
+        return;
+    }
+    en.key_up(Key::Raw(XKB_KEY_INSERT));
+    en.key_up(Key::Shift);
+
+    // Brief delay to allow the target application to process the paste event.
+    // Empirical value — no reliable synchronization mechanism exists on Wayland.
+    std::thread::sleep(std::time::Duration::from_millis(20));
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1621,6 +2139,64 @@ fn is_function_key(ck: &EnumOrUnknown<ControlKey>) -> bool {
     return res;
 }
 
+/// Check if any hotkey modifier (Ctrl/Alt/Meta) is currently pressed.
+/// Used to detect hotkey combinations like Ctrl+C, Alt+Tab, etc.
+///
+/// Note: Shift is intentionally NOT checked here. Shift+character produces a different
+/// character (e.g., Shift+a → 'A'), which is normal text input, not a hotkey.
+/// Shift is only relevant as a hotkey modifier when combined with Ctrl/Alt/Meta
+/// (e.g., Ctrl+Shift+Z), in which case this function already returns true via Ctrl.
+#[cfg(target_os = "linux")]
+#[inline]
+fn is_hotkey_modifier_pressed(en: &mut Enigo) -> bool {
+    get_modifier_state(Key::Control, en)
+        || get_modifier_state(Key::RightControl, en)
+        || get_modifier_state(Key::Alt, en)
+        || get_modifier_state(Key::RightAlt, en)
+        || get_modifier_state(Key::Meta, en)
+        || get_modifier_state(Key::RWin, en)
+}
+
+/// Release Shift keys before character input in Legacy/Translate mode.
+/// In these modes, the character has already been converted by the client,
+/// so we should input it directly without Shift modifier affecting the result.
+///
+/// Note: Does NOT release Shift if hotkey modifiers (Ctrl/Alt/Meta) are pressed,
+/// to preserve combinations like Ctrl+Shift+Z.
+#[cfg(target_os = "linux")]
+fn release_shift_for_char_input(en: &mut Enigo) {
+    // Don't release Shift if hotkey modifiers (Ctrl/Alt/Meta) are pressed.
+    // This preserves combinations like Ctrl+Shift+Z.
+    if is_hotkey_modifier_pressed(en) {
+        return;
+    }
+
+    // In translate mode, the client has already converted the keystroke to a character
+    // (e.g., Shift+a → 'A'). We release Shift here so the server inputs the character
+    // directly without Shift affecting the result.
+    //
+    // Shift is intentionally NOT restored after input — the client will send an explicit
+    // Shift key_up event when the user physically releases Shift. Restoring it here would
+    // cause a brief Shift re-press that could interfere with the next input event.
+
+    let is_x11 = crate::platform::linux::is_x11();
+
+    if get_modifier_state(Key::Shift, en) {
+        if !is_x11 {
+            en.key_up(Key::Shift);
+        } else {
+            simulate_(&EventType::KeyRelease(RdevKey::ShiftLeft));
+        }
+    }
+    if get_modifier_state(Key::RightShift, en) {
+        if !is_x11 {
+            en.key_up(Key::RightShift);
+        } else {
+            simulate_(&EventType::KeyRelease(RdevKey::ShiftRight));
+        }
+    }
+}
+
 fn legacy_keyboard_mode(evt: &KeyEvent) {
     #[cfg(windows)]
     crate::platform::windows::try_change_desktop();
@@ -1640,11 +2216,24 @@ fn legacy_keyboard_mode(evt: &KeyEvent) {
             process_control_key(&mut en, &ck, down)
         }
         Some(key_event::Union::Chr(chr)) => {
+            // For character input in Legacy mode, we need to release Shift first.
+            // The character has already been converted by the client, so we should
+            // input it directly without Shift modifier affecting the result.
+            // Only Ctrl/Alt/Meta should be kept for hotkeys like Ctrl+C.
+            #[cfg(target_os = "linux")]
+            release_shift_for_char_input(&mut en);
+
             let record_key = chr as u64 + KEY_CHAR_START;
             record_pressed_key(KeysDown::EnigoKey(record_key), down);
-            process_chr(&mut en, chr, down)
+            process_chr(&mut en, chr, down, has_hotkey_modifiers(evt))
         }
-        Some(key_event::Union::Unicode(chr)) => process_unicode(&mut en, chr),
+        Some(key_event::Union::Unicode(chr)) => {
+            // Same as Chr: release Shift for Unicode input
+            #[cfg(target_os = "linux")]
+            release_shift_for_char_input(&mut en);
+
+            process_unicode(&mut en, chr)
+        }
         Some(key_event::Union::Seq(ref seq)) => process_seq(&mut en, seq),
         _ => {}
     }
@@ -1665,6 +2254,55 @@ fn translate_process_code(code: u32, down: bool) {
 fn translate_keyboard_mode(evt: &KeyEvent) {
     match &evt.union {
         Some(key_event::Union::Seq(seq)) => {
+            // On Wayland:
+            // - uinput mode (--service): keep clipboard handling in this process because
+            //   clipboard is unreliable in root service context.
+            // - rdp_input mode (--server): forward sequence to custom keyboard handler so
+            //   ASCII can use Portal keysym and non-ASCII can use clipboard.
+            #[cfg(target_os = "linux")]
+            if !crate::platform::linux::is_x11() {
+                let mut en = ENIGO.lock().unwrap();
+                if wayland_use_rdp_input() {
+                    release_shift_for_char_input(&mut en);
+                    en.key_sequence(seq);
+                    return;
+                }
+
+                if wayland_use_uinput() {
+                    // Check if this is a hotkey (Ctrl/Alt/Meta pressed)
+                    // For hotkeys, we send character-based key events via Enigo instead of
+                    // using the clipboard. This relies on the local keyboard layout for
+                    // mapping characters to physical keys.
+                    // This assumes client and server use the same keyboard layout (common case).
+                    // Note: For non-Latin keyboards (e.g., Arabic), hotkeys may not work
+                    // correctly if the character cannot be mapped to a key via KEY_MAP_LAYOUT.
+                    // This is a known limitation - most common hotkeys (Ctrl+A/C/V/Z) use Latin
+                    // characters which are mappable on most keyboard layouts.
+                    if is_hotkey_modifier_pressed(&mut en) {
+                        // For hotkeys, send character-based key events via Enigo.
+                        // This relies on the local keyboard layout mapping (KEY_MAP_LAYOUT).
+                        for chr in seq.chars() {
+                            if !is_ascii_printable(chr) {
+                                log::warn!(
+                                    "Hotkey with non-ASCII character may not work correctly on non-Latin keyboard layouts"
+                                );
+                            }
+                            en.key_click(Key::Layout(chr));
+                        }
+                        return;
+                    }
+
+                    // Normal text input: release Shift and use clipboard
+                    release_shift_for_char_input(&mut en);
+                    if seq.chars().all(is_ascii_printable) {
+                        en.key_sequence(seq);
+                    } else {
+                        input_text_via_clipboard_server(&mut en, seq);
+                    }
+                    return;
+                }
+            }
+
             // Fr -> US
             // client: Shift + & => 1(send to remote)
             // remote: Shift + 1 => !
@@ -1682,11 +2320,16 @@ fn translate_keyboard_mode(evt: &KeyEvent) {
                 #[cfg(target_os = "linux")]
                 let simulate_win_hot_key = false;
                 if !simulate_win_hot_key {
-                    if get_modifier_state(Key::Shift, &mut en) {
-                        simulate_(&EventType::KeyRelease(RdevKey::ShiftLeft));
-                    }
-                    if get_modifier_state(Key::RightShift, &mut en) {
-                        simulate_(&EventType::KeyRelease(RdevKey::ShiftRight));
+                    #[cfg(target_os = "linux")]
+                    release_shift_for_char_input(&mut en);
+                    #[cfg(target_os = "windows")]
+                    {
+                        if get_modifier_state(Key::Shift, &mut en) {
+                            simulate_(&EventType::KeyRelease(RdevKey::ShiftLeft));
+                        }
+                        if get_modifier_state(Key::RightShift, &mut en) {
+                            simulate_(&EventType::KeyRelease(RdevKey::ShiftRight));
+                        }
                     }
                 }
                 for chr in seq.chars() {
@@ -1706,7 +2349,16 @@ fn translate_keyboard_mode(evt: &KeyEvent) {
         Some(key_event::Union::Chr(..)) => {
             #[cfg(target_os = "windows")]
             translate_process_code(evt.chr(), evt.down);
-            #[cfg(not(target_os = "windows"))]
+            #[cfg(target_os = "linux")]
+            {
+                if !crate::platform::linux::is_x11() {
+                    // Wayland: use uinput to send raw keycode
+                    wayland_send_raw_key(evt.chr() as u16, evt.down);
+                } else {
+                    sim_rdev_rawkey_position(evt.chr() as _, evt.down);
+                }
+            }
+            #[cfg(target_os = "macos")]
             sim_rdev_rawkey_position(evt.chr() as _, evt.down);
         }
         Some(key_event::Union::Unicode(..)) => {
@@ -1717,7 +2369,11 @@ fn translate_keyboard_mode(evt: &KeyEvent) {
             simulate_win2win_hotkey(*code, evt.down);
         }
         _ => {
-            log::debug!("Unreachable. Unexpected key event {:?}", &evt);
+            log::debug!(
+                "Unreachable. Unexpected key event (mode={:?}, down={:?})",
+                &evt.mode,
+                &evt.down
+            );
         }
     }
 }
@@ -1922,6 +2578,10 @@ impl TemporaryMouseMoveHandle {
         let thread_handle = std::thread::spawn(move || {
             log::debug!("TemporaryMouseMoveHandle thread started");
             for (x, y) in rx {
+                // Not the peer's position: the calibration must not subtract from it.
+                #[cfg(feature = "drm")]
+                forget_sample_and_move(|| ENIGO.lock().unwrap(), |mut en| en.mouse_move_to(x, y));
+                #[cfg(not(feature = "drm"))]
                 ENIGO.lock().unwrap().mouse_move_to(x, y);
             }
             log::debug!("TemporaryMouseMoveHandle thread exiting");
@@ -2056,4 +2716,151 @@ lazy_static::lazy_static! {
         (ControlKey::Insert, true),
         (ControlKey::Delete, true),
     ].iter().map(|(a, b)| (a.value(), b.clone())).collect();
+}
+
+#[cfg(test)]
+mod cursor_shape_tests {
+    use super::*;
+
+    fn shape(id: u64) -> Arc<Message> {
+        let mut msg = Message::new();
+        msg.set_cursor_data(CursorData {
+            id,
+            ..Default::default()
+        });
+        Arc::new(msg)
+    }
+
+    // One test, since the shapes are kept process-wide.
+    #[test]
+    fn a_shape_is_kept_once_and_can_be_asked_for_again() {
+        let first = shared_cursor_shape(shape(u64::MAX - 1));
+        let again = shared_cursor_shape(shape(u64::MAX - 1));
+        assert!(Arc::ptr_eq(&first, &again), "a second handle shares it");
+        let asked = cursor_data_message(u64::MAX - 1).expect("a sent shape is kept");
+        assert!(Arc::ptr_eq(&asked, &first));
+        assert!(cursor_data_message(u64::MAX - 2).is_none());
+
+        let raw = |handle| CursorData {
+            id: handle,
+            width: 4,
+            height: 4,
+            colors: vec![9u8; 4 * 4 * 4].into(),
+            ..Default::default()
+        };
+        let mut compressed = 0;
+        let mut compress = |rgba: &[u8]| {
+            compressed += 1;
+            hbb_common::compress::compress(rgba)
+        };
+        let shown = cursor_shape_message(raw(1), &mut compress);
+        let again = cursor_shape_message(raw(2), &mut compress);
+        assert!(Arc::ptr_eq(&shown, &again), "a new handle, the same shape");
+        assert_eq!(compressed, 1, "a shape sent before is not compressed again");
+
+        let sending = shared_cursor_shape(shape(u64::MAX - 3));
+        let mut few = HashMap::from([(1, shown.clone())]);
+        limit_cursor_handles(&mut few, &sending);
+        assert_eq!(few.len(), 1, "below the ceiling nothing goes");
+
+        let mut handles: HashMap<u64, Arc<Message>> = (0..CURSOR_HANDLES_MAX as u64)
+            .map(|handle| (handle, shown.clone()))
+            .collect();
+        limit_cursor_handles(&mut handles, &sending);
+        assert!(
+            handles.is_empty(),
+            "past the ceiling the handles start over"
+        );
+        let Some(message::Union::CursorData(cd)) = &shown.union else {
+            panic!("a cursor shape");
+        };
+        assert!(
+            cursor_data_message(cd.id).is_none(),
+            "and the shapes with them"
+        );
+        assert!(
+            cursor_data_message(u64::MAX - 3).is_some(),
+            "but the shape being sent is kept"
+        );
+
+        let big = |id| {
+            let mut msg = Message::new();
+            msg.set_cursor_data(CursorData {
+                id,
+                colors: vec![0u8; CURSOR_SHAPES_BYTES_MAX / 2 + 1].into(),
+                ..Default::default()
+            });
+            Arc::new(msg)
+        };
+        shared_cursor_shape(big(u64::MAX - 4));
+        let sending = shared_cursor_shape(big(u64::MAX - 5));
+        let mut few = HashMap::from([(1, shown.clone())]);
+        limit_cursor_handles(&mut few, &sending);
+        assert!(
+            few.is_empty(),
+            "past the byte ceiling the handles start over"
+        );
+        assert!(cursor_data_message(u64::MAX - 4).is_none());
+        assert!(cursor_data_message(u64::MAX - 5).is_some());
+
+        super::super::service::Reset::reset(&mut StateCursor::default());
+        assert!(
+            cursor_data_message(u64::MAX - 1).is_none(),
+            "a reset forgets them"
+        );
+    }
+}
+
+#[cfg(all(test, target_os = "linux", feature = "drm"))]
+mod peer_abs_sample_tests {
+    use super::*;
+
+    // The two writers share one static and libtest runs tests concurrently.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn a_move_without_an_absolute_sample_forgets_the_last_one() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        note_peer_absolute_move(20, 30);
+        let s = last_peer_abs_sample().expect("an absolute move leaves a sample");
+        assert_eq!(s.pos, (20, 30));
+        assert!(s.age_ms < 1_000);
+        note_pointer_moved_without_absolute_sample();
+        assert_eq!(last_peer_abs_sample(), None);
+    }
+
+    #[test]
+    fn every_absolute_move_is_a_new_sample() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        note_peer_absolute_move(1, 1);
+        let a = last_peer_abs_sample().unwrap().seq;
+        note_peer_absolute_move(1, 1);
+        let b = last_peer_abs_sample().unwrap().seq;
+        assert!(b > a, "same point, distinct sample");
+        note_pointer_moved_without_absolute_sample();
+    }
+
+    #[test]
+    fn a_move_of_this_process_forgets_the_sample_of_a_peer_move_it_waited_for() {
+        let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+        let mouse = std::sync::Arc::new(std::sync::Mutex::new(()));
+        note_peer_absolute_move(5, 5);
+        // The peer holds the mouse lock when the move of this process starts.
+        let peer = mouse.lock().unwrap();
+        let (asked, asking) = std::sync::mpsc::channel();
+        let m = mouse.clone();
+        let mover = std::thread::spawn(move || {
+            let lock = || {
+                asked.send(()).unwrap();
+                m.lock().unwrap()
+            };
+            forget_sample_and_move(lock, |_| {})
+        });
+        asking.recv().unwrap();
+        assert!(last_peer_abs_sample().is_some(), "nothing forgotten before the lock");
+        note_peer_absolute_move(50, 50);
+        drop(peer);
+        mover.join().unwrap();
+        assert_eq!(last_peer_abs_sample(), None, "the move of this process came last");
+    }
 }
