@@ -11,7 +11,7 @@
 //! - BUILTIN_SETTINGS：界面开关（hide-* 等）。
 
 use base::config::keys;
-use hbb_common::config;
+use hbb_common::{allow_err, config, log, tokio};
 use std::{collections::HashMap, sync::RwLock, time::Duration};
 
 /// ID 服务器（hbbs），显式带端口，不依赖 hbb_common 的默认端口常量。
@@ -114,10 +114,10 @@ pub fn update_version() -> Option<String> {
 
 /// 由 `common::check_software_update` 调用，在后台线程里查询。
 pub fn check_update_via_api() {
-    std::thread::spawn(|| hbb_common::allow_err!(check_update_via_api_()));
+    std::thread::spawn(|| allow_err!(check_update_via_api_()));
 }
 
-#[hbb_common::tokio::main(flavor = "current_thread")]
+#[tokio::main(flavor = "current_thread")]
 async fn check_update_via_api_() -> hbb_common::ResultType<()> {
     let token = config::LocalConfig::get_option("access_token");
     let api = crate::get_api_server(
