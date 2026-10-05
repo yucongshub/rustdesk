@@ -92,3 +92,115 @@ fn fill(map: &RwLock<HashMap<String, String>>, items: &[(&str, &str)]) {
         map.entry((*k).to_owned()).or_insert_with(|| (*v).to_owned());
     }
 }
+
+// ---------- 版本检测：已登录时向自建 API 查询，只提示，不下载不安装 ----------
+//
+// 不访问官方更新服务（api.rustdesk.com）。rustdesk_api 的 POST /api/version/latest 要求登录
+// token，返回 {"version", "url"}：url 是公司内部的下载页面。版本号比当前新时，在首页显示
+// “版本更新”卡片，点击后用浏览器打开该页面（见 desktop_home_page.dart 的 buildHelpCards）。
+// 触发时机：启动时、登录成功后、之后每 24 小时（Flutter 侧调用 mainGetSoftwareUpdateUrl）。
+
+/// 自建版本检测接口的路径（拼在 api-server 之后）。
+pub const UPDATE_CHECK_PATH: &str = "/api/version/latest";
+
+/// 有新版本时为新版本号，否则为空。
+static UPDATE_VERSION: RwLock<String> = RwLock::new(String::new());
+
+/// 当前提示的新版本号（没有新版本时为 None）。
+pub fn update_version() -> Option<String> {
+    let v = UPDATE_VERSION.read().unwrap().clone();
+    (!v.is_empty()).then_some(v)
+}
+
+/// 由 `common::check_software_update` 调用，在后台线程里查询。
+pub fn check_update_via_api() {
+    std::thread::spawn(|| hbb_common::allow_err!(check_update_via_api_()));
+}
+
+#[hbb_common::tokio::main(flavor = "current_thread")]
+async fn check_update_via_api_() -> hbb_common::ResultType<()> {
+    let token = config::LocalConfig::get_option("access_token");
+    let api = crate::get_api_server(
+        config::Config::get_option("api-server"),
+        config::Config::get_option("custom-rendezvous-server"),
+    );
+    if token.is_empty() || api.is_empty() {
+        set_update(None);
+        return Ok(());
+    }
+    let body = serde_json::json!({
+        "id": config::Config::get_id(),
+        "version": crate::VERSION,
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+    })
+    .to_string();
+    let resp = crate::post_request(
+        format!("{}{}", api, UPDATE_CHECK_PATH),
+        body,
+        &format!("Authorization: Bearer {}", token),
+    )
+    .await?;
+    set_update(pick_update(&resp, crate::VERSION));
+    Ok(())
+}
+
+/// 解析接口返回：版本号比 `current` 新、且链接是 http(s) 时返回 (版本号, 链接)。
+fn pick_update(resp: &str, current: &str) -> Option<(String, String)> {
+    let v: serde_json::Value = serde_json::from_str(resp).ok()?;
+    let version = v.get("version")?.as_str()?.trim();
+    let url = v.get("url")?.as_str()?.trim();
+    if version.is_empty() || !(url.starts_with("https://") || url.starts_with("http://")) {
+        return None;
+    }
+    if hbb_common::get_version_number(version) <= hbb_common::get_version_number(current) {
+        return None;
+    }
+    Some((version.to_owned(), url.to_owned()))
+}
+
+fn set_update(update: Option<(String, String)>) {
+    let (version, url) = update.unwrap_or_default();
+    *UPDATE_VERSION.write().unwrap() = version;
+    *crate::common::SOFTWARE_UPDATE_URL.lock().unwrap() = url.clone();
+    // 通知界面：url 为空时隐藏卡片（例如登出后、或已是最新版本）
+    #[cfg(feature = "flutter")]
+    {
+        let mut m = HashMap::new();
+        m.insert("name", "check_software_update_finish");
+        m.insert("url", url.as_str());
+        if let Ok(data) = serde_json::to_string(&m) {
+            let _ = crate::flutter::push_global_event(crate::flutter::APP_TYPE_MAIN, data);
+        }
+    }
+}
+
+#[cfg(test)]
+mod update_tests {
+    use super::pick_update;
+
+    const URL: &str = "https://intranet.example.com/rustdesk";
+
+    #[test]
+    fn newer_version_with_http_link_is_offered() {
+        let resp = format!(r#"{{"version":"1.5.0-1","url":"{URL}"}}"#);
+        assert_eq!(pick_update(&resp, "1.5.0"), Some(("1.5.0-1".to_owned(), URL.to_owned())));
+        assert_eq!(pick_update(&resp, "1.4.6"), Some(("1.5.0-1".to_owned(), URL.to_owned())));
+    }
+
+    #[test]
+    fn same_or_older_version_is_not_offered() {
+        let resp = format!(r#"{{"version":"1.5.0","url":"{URL}"}}"#);
+        assert_eq!(pick_update(&resp, "1.5.0"), None);
+        assert_eq!(pick_update(&resp, "1.5.0-1"), None);
+    }
+
+    #[test]
+    fn empty_or_unsafe_responses_are_ignored() {
+        assert_eq!(pick_update(r#"{"version":"","url":""}"#, "1.5.0"), None);
+        assert_eq!(pick_update(r#"{"error":"unauthorized"}"#, "1.5.0"), None);
+        assert_eq!(pick_update(r#"{"version":"9.9.9","url":"javascript:alert(1)"}"#, "1.5.0"), None);
+        assert_eq!(pick_update(r#"{"version":"9.9.9","url":"file:///etc/passwd"}"#, "1.5.0"), None);
+        assert_eq!(pick_update("not json", "1.5.0"), None);
+    }
+}

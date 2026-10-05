@@ -11,6 +11,7 @@ import '../common.dart';
 import '../utils/http_service.dart' as http;
 import 'model.dart';
 import 'platform_model.dart';
+import 'state_model.dart';
 
 bool refreshingUser = false;
 
@@ -145,6 +146,8 @@ class UserModel {
     userName.value = '';
     displayName.value = '';
     avatar.value = '';
+    // 定制：登出后隐藏版本更新提示（版本检测需要登录，见 custom_settings.rs）
+    stateGlobal.updateUrl.value = '';
   }
 
   _parseAndUpdateUser(UserPayload user) {

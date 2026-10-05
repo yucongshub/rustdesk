@@ -4084,6 +4084,10 @@ void checkUpdate() {
       Timer(const Duration(seconds: 1), () async {
         bind.mainGetSoftwareUpdateUrl();
       });
+      // 定制：每 24 小时向自建 API 检查一次新版本（未登录时不请求，见 custom_settings.rs）
+      Timer.periodic(const Duration(hours: 24), (_) {
+        bind.mainGetSoftwareUpdateUrl();
+      });
     }
   }
 }

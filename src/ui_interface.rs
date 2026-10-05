@@ -748,6 +748,10 @@ pub fn current_is_wayland() -> bool {
 
 #[inline]
 pub fn get_new_version() -> String {
+    // 定制：自建版本检测的版本号（SOFTWARE_UPDATE_URL 此时是内部下载页面，不含版本号）
+    if let Some(v) = crate::custom_settings::update_version() {
+        return v;
+    }
     (*SOFTWARE_UPDATE_URL
         .lock()
         .unwrap()
