@@ -573,6 +573,11 @@ _registerEventHandler() {
       });
     });
   }
+
+  // Register logout handler for session inactive
+  platformFFI.registerEventHandler('logout', 'logout', (_) async {
+    await gFFI.userModel.reset(resetOther: true);
+  });
 }
 
 Widget keyListenerBuilder(BuildContext context, Widget? child) {

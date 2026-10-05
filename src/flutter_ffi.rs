@@ -1254,7 +1254,14 @@ pub fn main_set_env(key: String, value: Option<String>) -> SyncReturn<()> {
 pub fn main_set_local_option(key: String, value: String) {
     let is_texture_render_key = key.eq(keys::OPTION_TEXTURE_RENDER);
     let is_d3d_render_key = key.eq(keys::OPTION_ALLOW_D3D_RENDER);
-    set_local_option(key, value.clone());
+    let is_access_token = key.eq("access_token");
+    set_local_option(key.clone(), value.clone());
+    #[cfg(not(any(target_os = "ios")))]
+    if is_access_token {
+        *crate::hbbs_http::sync::ACCESS_TOKEN.write().unwrap() = value.clone();
+        send_to_cm(&crate::ipc::Data::Config((key.clone(), Some(value.clone()))));
+        crate::ui_interface::send_to_daemon(&crate::ipc::Data::Config((key, Some(value.clone()))));
+    }
     let is_render_target =
         |session: &crate::flutter::FlutterSession| session.is_default() || session.is_view_camera();
     if is_texture_render_key {
