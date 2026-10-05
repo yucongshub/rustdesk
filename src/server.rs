@@ -671,6 +671,8 @@ pub async fn start_server(is_server: bool, no_server: bool) {
 
     if is_server {
         crate::common::set_server_running(true);
+        // 公司定制：一次性配置迁移，见 custom_settings.rs
+        crate::custom_settings::migrate_once();
         std::thread::spawn(move || {
             if let Err(err) = crate::ipc::start("") {
                 log::error!("Failed to start ipc: {}", err);

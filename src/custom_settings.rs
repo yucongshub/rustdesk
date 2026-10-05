@@ -69,6 +69,28 @@ pub fn apply() {
     );
 }
 
+/// 一次性迁移的标记，保存在 RustDesk2.toml 的 options 中。
+pub const MIGRATION_MARKER: &str = "scdesk-migrated-v1";
+
+/// 一次性迁移，在接受连接的进程（`start_server` 的 server 分支）启动时调用。
+///
+/// 旧版本每次启动都把 allow-remote-config-modification=Y 写进配置文件，新版本不再强制
+/// （官方默认 N）。这里删除配置文件中保存的 Y，恢复默认；迁移后写入标记，之后管理员或
+/// 用户有意再开启的值不会被清除。由 custom.txt 等以默认值/强制值下发的设置不受影响。
+pub fn migrate_once() {
+    if config::Config::get_option(MIGRATION_MARKER) == "Y" {
+        return;
+    }
+    let key = keys::OPTION_ALLOW_REMOTE_CONFIG_MODIFICATION;
+    let configured_by_admin = config::OVERWRITE_SETTINGS.read().unwrap().contains_key(key)
+        || config::DEFAULT_SETTINGS.read().unwrap().contains_key(key);
+    if !configured_by_admin && config::Config::get_option(key) == "Y" {
+        config::Config::set_option(key.to_owned(), "".to_owned());
+        hbb_common::log::info!("迁移：清除旧版本强制写入的 {}=Y，恢复默认 N", key);
+    }
+    config::Config::set_option(MIGRATION_MARKER.to_owned(), "Y".to_owned());
+}
+
 fn fill(map: &RwLock<HashMap<String, String>>, items: &[(&str, &str)]) {
     let mut map = map.write().unwrap();
     for (k, v) in items {
