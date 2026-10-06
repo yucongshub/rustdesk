@@ -428,18 +428,18 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   }
 
   Widget buildHelpCards(String updateUrl) {
-    if (!bind.isCustomClient() &&
-        updateUrl.isNotEmpty &&
-        !isCardClosed &&
-        bind.mainUriPrefixSync().contains('rustdesk')) {
-      // 定制：只提示，点击后用浏览器打开公司内部的下载页面（updateUrl 来自自建 API，
-      // 见 custom_settings.rs），不在客户端里下载、安装
+    // 定制：updateUrl 只来自自建 API（见 custom_settings.rs），不再按 uri 前缀判断是否官方版。
+    if (!bind.isCustomClient() && updateUrl.isNotEmpty && !isCardClosed) {
+      // 只提示：用超链接“发现新版本”在浏览器中打开公司内部的下载页面，
+      // 不显示地址，也不在客户端里下载、安装
       return buildInstallCard(
           "Status",
           "${translate("new-version-of-{${bind.mainGetAppNameSync()}}-tip")} (${bind.mainGetNewVersion()}).",
-          'Download', () async {
-        await launchUrl(Uri.parse(updateUrl));
-      }, closeButton: true);
+          "",
+          () {},
+          closeButton: true,
+          help: '发现新版本',
+          link: updateUrl);
     }
     if (systemError.isNotEmpty) {
       return buildInstallCard("", systemError, "", () {});
