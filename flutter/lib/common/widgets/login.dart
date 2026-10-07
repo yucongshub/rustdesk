@@ -780,6 +780,10 @@ Future<bool?> _openLoginDialog() async {
                   key: 'access_token', value: resp.access_token!);
               await bind.mainSetLocalOption(
                   key: 'user_info', value: jsonEncode(resp.user ?? {}));
+              // 定制：登录后立即检查新版本（自建 API 需要登录 token，见 custom_settings.rs）
+              if (!isWeb && !bind.isCustomClient()) {
+                bind.mainGetSoftwareUpdateUrl();
+              }
             }
             if (close != null) {
               close(true);
