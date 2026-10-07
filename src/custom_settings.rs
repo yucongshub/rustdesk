@@ -20,6 +20,9 @@ pub const RENDEZVOUS_SERVER: &str = "scdesk.succez.com:22116";
 pub const API_SERVER: &str = "https://scdesk.succez.com:22111";
 /// hbbs 公钥。
 pub const RS_PUB_KEY: &str = "MUGpFstr3XGdryYqJsa2M1MWwRLNvjsOgSgmFmw4aKQ=";
+/// WebRTC 使用的 STUN 服务器（自建 coturn，只开 STUN，不做 TURN）。
+/// 配置了 STUN 后，客户端不再使用 hbb_common 内置的公网 STUN。
+pub const ICE_SERVERS: &str = "stun:scdesk.succez.com:3478";
 
 /// 发起打洞请求前，等待 UDP NAT 探测结果的最短时间（拿到结果会立即继续）。
 /// 带 token 的请求也会等待，官方 1.5.0 在完成密钥交换后不再等待。
@@ -35,6 +38,7 @@ pub fn apply() {
             (keys::OPTION_CUSTOM_RENDEZVOUS_SERVER, RENDEZVOUS_SERVER),
             (keys::OPTION_API_SERVER, API_SERVER),
             (keys::OPTION_KEY, RS_PUB_KEY),
+            (keys::OPTION_ICE_SERVERS, ICE_SERVERS),
         ],
     );
     // 强制值（界面中已隐藏）。
@@ -53,6 +57,8 @@ pub fn apply() {
         &[
             (keys::OPTION_ENABLE_UDP_PUNCH, "Y"),
             (keys::OPTION_ENABLE_IPV6_PUNCH, "Y"),
+            // 非官方服务器默认关闭 WebRTC；hbbs 已支持 WebRTC 信令，这里打开。
+            (keys::OPTION_ENABLE_WEBRTC, "Y"),
             (keys::OPTION_ENABLE_CHECK_UPDATE, "N"),
             (keys::OPTION_TEXTURE_RENDER, "Y"),
         ],
