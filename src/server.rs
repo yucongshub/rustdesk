@@ -232,6 +232,7 @@ pub async fn create_tcp_connection(
             bail!("evicted to make room for a newer unauthenticated connection");
         }
     }
+    crate::custom_settings::refuse_insecure_controlled(&mut stream).await?;
 
     #[cfg(target_os = "macos")]
     {

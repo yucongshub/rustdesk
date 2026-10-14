@@ -219,6 +219,24 @@ impl<T: InvokeUiSession> Remote<T> {
                     .set_connection_type(is_secured, direct, stream_type); // flutter -> connection_ready
                 if !is_secured
                     && !crate::common::is_direct_ip_access(&self.handler.get_id())
+                    && crate::custom_settings::require_secure_controller()
+                {
+                    // 标题不用 "Connection Error"，避免 check_if_retry 自动重连
+                    self.handler.msgbox(
+                        "error",
+                        "Insecure Connection",
+                        crate::custom_settings::MSG_INSECURE_REFUSED,
+                        "",
+                    );
+                    self.send_close_reason(&mut peer, "").await;
+                    if kcp.is_some() {
+                        tokio::time::sleep(KCP_CLOSE_REASON_FLUSH_DELAY).await;
+                    }
+                    self.handle_disconnected(round);
+                    return;
+                }
+                if !is_secured
+                    && !crate::common::is_direct_ip_access(&self.handler.get_id())
                     && !client::confirm_insecure_connection(&self.handler, &mut self.receiver).await
                 {
                     self.send_close_reason(&mut peer, "").await;
