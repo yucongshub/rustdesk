@@ -18,8 +18,8 @@ use std::{collections::HashMap, sync::RwLock, time::Duration};
 pub const RENDEZVOUS_SERVER: &str = "scdesk.succez.com:22116";
 /// API 服务器。
 pub const API_SERVER: &str = "https://scdesk.succez.com:22111";
-/// hbbs 公钥。
-pub const RS_PUB_KEY: &str = "MUGpFstr3XGdryYqJsa2M1MWwRLNvjsOgSgmFmw4aKQ=";
+/// hbbs 公钥（2026-10-14 更换，hbbs 持有对应私钥）。
+pub const RS_PUB_KEY: &str = "fg36LlyIk7hGfEcYJkNAA561Je0oLNDHOEdVRYf8Ihs=";
 /// WebRTC 使用的 STUN 服务器（自建 coturn，只开 STUN，不做 TURN）。
 /// 配置了 STUN 后，客户端不再使用 hbb_common 内置的公网 STUN。
 pub const ICE_SERVERS: &str = "stun:scdesk.succez.com:3478";
@@ -37,7 +37,6 @@ pub fn apply() {
         &[
             (keys::OPTION_CUSTOM_RENDEZVOUS_SERVER, RENDEZVOUS_SERVER),
             (keys::OPTION_API_SERVER, API_SERVER),
-            (keys::OPTION_KEY, RS_PUB_KEY),
             (keys::OPTION_ICE_SERVERS, ICE_SERVERS),
         ],
     );
@@ -46,6 +45,9 @@ pub fn apply() {
     fill(
         &config::OVERWRITE_SETTINGS,
         &[
+            // 公钥用强制值：用户手动填过、或旧版本保存在配置文件中的旧公钥一律忽略，
+            // 否则升级后仍用旧公钥验证 hbbs 的签名，连接失败。
+            (keys::OPTION_KEY, RS_PUB_KEY),
             (keys::OPTION_ENABLE_LAN_DISCOVERY, "N"),
             (keys::OPTION_DIRECT_SERVER, "N"),
             (keys::OPTION_ENABLE_AUDIO, "N"),
