@@ -99,6 +99,47 @@ fn fill(map: &RwLock<HashMap<String, String>>, items: &[(&str, &str)]) {
     }
 }
 
+// ---------- 要求端到端加密：默认关闭，由服务端打开 ----------
+//
+// rustdesk_api 在心跳响应的 strategy.config_options 中下发 scdesk-require-secure=Y
+// （hbbs_http/sync.rs 的 handle_config_options 写入服务进程的配置），下发空值即关闭。
+// 打开后，发起端无法建立端到端加密时直接断开，不再提供“继续”；被控端拒绝不加密的连接。
+// 只应在所有客户端都能加密之后打开：旧客户端参与的会话都不加密。
+
+pub const OPTION_REQUIRE_SECURE: &str = "scdesk-require-secure";
+pub const MSG_INSECURE_REFUSED: &str =
+    "无法与对方建立端到端加密连接，按管理员要求已断开。请确认双方都已升级到最新版本。";
+
+/// 发起端：会话运行在界面进程，服务进程写入的配置经 IPC 同步到 ui_interface 的选项缓存。
+pub fn require_secure_controller() -> bool {
+    crate::ui_interface::get_option(OPTION_REQUIRE_SECURE) == "Y"
+        || config::Config::get_option(OPTION_REQUIRE_SECURE) == "Y"
+}
+
+/// 被控端：在服务进程中运行。
+pub fn require_secure_controlled() -> bool {
+    config::Config::get_option(OPTION_REQUIRE_SECURE) == "Y"
+}
+
+/// 被控端握手之后调用：要求加密而没有建立加密时，先告诉发起端原因（显示为登录错误），再拒绝连接。
+pub async fn refuse_insecure_controlled(
+    stream: &mut hbb_common::Stream,
+) -> hbb_common::ResultType<()> {
+    if stream.is_secured() || !require_secure_controlled() {
+        return Ok(());
+    }
+    let mut res = base::message_proto::LoginResponse::new();
+    res.set_error(MSG_INSECURE_REFUSED.to_owned());
+    let mut msg = base::message_proto::Message::new();
+    msg.set_login_response(res);
+    match hbb_common::timeout(3_000, stream.send(&msg)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => log::warn!("failed to send the insecure refusal: {}", err),
+        Err(_) => log::warn!("timed out sending the insecure refusal"),
+    }
+    hbb_common::bail!("refused an unencrypted connection ({}=Y)", OPTION_REQUIRE_SECURE);
+}
+
 // ---------- 版本检测：已登录时向自建 API 查询，只提示，不下载不安装 ----------
 //
 // 不访问官方更新服务（api.rustdesk.com）。rustdesk_api 的 POST /api/version/latest 要求登录
