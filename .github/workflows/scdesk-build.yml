@@ -603,6 +603,8 @@ jobs:
         if: env.UPLOAD_ARTIFACT == 'true'
         run: |
           for name in rustdesk*??.dmg; do
+              # 未签名的 dmg 创建时已带平台后缀，不再重复添加（否则 Release 中会多出一份 -aarch64-aarch64.dmg）
+              case "$name" in *-${{ matrix.job.arch }}.dmg) continue ;; esac
               mv "$name" "${name%%.dmg}-${{ matrix.job.arch }}.dmg"
           done
 
