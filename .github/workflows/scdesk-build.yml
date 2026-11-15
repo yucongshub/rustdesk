@@ -353,7 +353,9 @@ jobs:
         if: env.UPLOAD_ARTIFACT == 'true'
         run: |
           pushd ./res/msi
-          python preprocess.py --arp -d ../../rustdesk
+          # 显式传入版本号：preprocess.py 只把参数中的 1.5.0-1 换成 1.5.0.1；从 rustdesk.exe 读到的版本不替换，
+          # 会拼成 1.5.0-1.<revision>，不是合法的 MSI 版本号（WiX ICE24）
+          python preprocess.py --arp -d ../../rustdesk -v ${{ env.VERSION }}
           nuget restore msi.sln
           $msiPlatform = if ('${{ matrix.job.arch }}' -eq 'aarch64') { 'ARM64' } else { 'x64' }
           msbuild msi.sln -p:Configuration=Release -p:Platform=$msiPlatform /p:TargetVersion=Windows10
@@ -401,7 +403,7 @@ jobs:
             }
           - {
               target: aarch64-apple-darwin,
-              os: macos-14,
+              os: macos-15,
               # extra-build-args: "--disable-flutter-texture-render", # disable this for mac, because we see a lot of users reporting flickering both on arm and x64, and we can not confirm if texture rendering has better performance if htere is no vram, https://github.com/rustdesk/rustdesk/issues/6296
               extra-build-args: "--screencapturekit",
               arch: aarch64,
@@ -601,6 +603,8 @@ jobs:
         if: env.UPLOAD_ARTIFACT == 'true'
         run: |
           for name in rustdesk*??.dmg; do
+              # 未签名的 dmg 创建时已带平台后缀，不再重复添加（否则 Release 中会多出一份 -aarch64-aarch64.dmg）
+              case "$name" in *-${{ matrix.job.arch }}.dmg) continue ;; esac
               mv "$name" "${name%%.dmg}-${{ matrix.job.arch }}.dmg"
           done
 
